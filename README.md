@@ -1,36 +1,39 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Ember
 
-## Getting Started
+A calm, keyboard-first daily habit tracker. Check off habits, build streaks, keep the flame alive.
 
-First, run the development server:
+Built with Next.js 16 (App Router), Supabase (Postgres + magic-link auth + RLS), Tailwind v4, shadcn/ui, Motion and Lucide.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+## Setup
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+1. Install dependencies:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+   ```bash
+   npm install
+   ```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+2. Copy `.env.example` to `.env.local` and fill in your Supabase project URL, publishable key and (for migrations) the Session pooler connection string.
 
-## Learn More
+3. Apply the database migration:
 
-To learn more about Next.js, take a look at the following resources:
+   ```bash
+   psql "$DATABASE_URL" -1 -f supabase/migrations/20260930000000_init_habits.sql
+   ```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+4. In Supabase → Authentication → URL Configuration, add `http://localhost:3000/auth/callback` to the redirect URLs.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+5. Start the dev server:
 
-## Deploy on Vercel
+   ```bash
+   npm run dev
+   ```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Keyboard shortcuts
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+| Action | Keys |
+| --- | --- |
+| Command palette | `⌘ K` |
+| New habit | `N` |
+| Check off habit | `1`–`9` |
+| Go to Today / Habits / Settings | `G T` / `G H` / `G S` |
+| Toggle sidebar | `[` |
