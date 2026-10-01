@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { createServerClient } from "@supabase/ssr"
 
-const APP_ROUTES = ["/today", "/habits", "/settings"]
+const APP_ROUTES = ["/today", "/habits", "/settings", "/reset-password"]
 
 export async function updateSession(request: NextRequest) {
   let response = NextResponse.next({ request })

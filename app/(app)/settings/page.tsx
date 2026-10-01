@@ -2,6 +2,7 @@ import type { Metadata } from "next"
 import { LogOut } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ThemePicker } from "@/components/app/theme-picker"
+import { PasswordForm } from "@/components/password-form"
 import { getTimeZone, getUserEmail } from "@/lib/data"
 import { signOut } from "../actions"
 
@@ -29,7 +30,7 @@ export default async function SettingsPage() {
         <Section title="Appearance" description="Choose how Ember looks. System follows your OS.">
           <ThemePicker />
         </Section>
-        <Section title="Account" description="You sign in with a magic link. No password needed.">
+        <Section title="Account" description="The email you sign in with.">
           <div className="hairline flex items-center gap-3 rounded-xl bg-surface/60 px-4 py-3">
             <span className="grid size-8 shrink-0 place-items-center rounded-full bg-gradient-to-br from-[#FFB26B] to-[#E0342B] text-sm font-semibold text-white uppercase">
               {email?.[0] ?? "?"}
@@ -45,6 +46,14 @@ export default async function SettingsPage() {
               Sign out
             </Button>
           </form>
+        </Section>
+        <Section
+          title="Password"
+          description="Set a password to sign in without waiting for an email. Magic links keep working too."
+        >
+          <div className="max-w-sm">
+            <PasswordForm />
+          </div>
         </Section>
         <Section title="Keyboard shortcuts" description="Ember is built to be driven from the keyboard.">
           <dl className="space-y-2 text-sm">
