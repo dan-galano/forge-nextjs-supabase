@@ -1,0 +1,17 @@
+{
+  "import_mode": "managed",
+  "build_kind": "nextjs",
+  "imported_at": "2026-10-26T06:18:03Z",
+  "forge_app_id": "01a176db-de81-7a16-b557-52f619595729",
+  "dev_cmd": [
+    "npx",
+    "--no",
+    "next",
+    "dev",
+    "--port",
+    "3000"
+  ],
+  "internal_port": 3000,
+  "dockerfile_origin": "forge",
+  "dockerfile_sha256": "2027a5aaefa852908d826c7d2639ba082d99fa005ea47a606d15ce233a650a78"
+}
