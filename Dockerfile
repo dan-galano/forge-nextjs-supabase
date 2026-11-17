@@ -7,6 +7,9 @@
 #     family covers
 #   - next.config.ts does not set output: 'standalone', so the runtime runs
 #     `next start`
+#   - Next.js compiles NEXT_PUBLIC_* values in at build time, so the build
+#     compiles a marker for each one the code reads and the container replaces
+#     the markers with its own environment's values when it starts
 #   - the package manager resolved to npm, from the default (no packageManager
 #     field and no non-npm lockfile)
 #
@@ -50,11 +53,111 @@ FROM node:22-alpine AS build
 
 WORKDIR /app
 
+# Next.js compiles NEXT_PUBLIC_* values into the app at build time, but an
+# App's configuration reaches the container only when it starts. This script
+# gives the build a marker for each value, and swaps in the environment's
+# own values when the container starts (Forge D-280).
+COPY <<"FORGE_PUBLIC_ENV" /usr/local/lib/forge/public-env.mjs
+// Forge public configuration (D-280), written by Forge's Dockerfile generator.
+//
+// Next.js compiles every NEXT_PUBLIC_* value into the app at `next build`.
+// Forge builds once, at Stage, and runs the same image in every
+// environment, so the build compiles a marker for each value and the
+// container swaps in its own environment's values when it starts.
+//
+//   node public-env.mjs --placeholders   prints NAME=marker for the build
+//   node --import public-env.mjs ...     applies this environment's values
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { extname, join } from "node:path";
+import { pathToFileURL } from "node:url";
+
+const MARK = "@@FORGE_PUBLIC:";
+const MARKER = /@@FORGE_PUBLIC:([A-Za-z_][A-Za-z0-9_]*)@@/g;
+const SOURCE = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts", ".mdx"]);
+
+function walk(dir, skipDir, visit) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (!skipDir(entry.name, path)) walk(path, skipDir, visit);
+    } else if (entry.isFile()) {
+      visit(path);
+    }
+  }
+}
+
+// Names a committed .env.production or .env defines: Next.js reads those at
+// build time, and a marker would override them.
+function definedInEnvFiles() {
+  const names = new Set();
+  for (const file of [".env.production", ".env"]) {
+    if (!existsSync(file)) continue;
+    for (const line of readFileSync(file, "utf8").split(/\r?\n/)) {
+      const m = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/.exec(line);
+      if (m) names.add(m[1]);
+    }
+  }
+  return names;
+}
+
+function printPlaceholders() {
+  const names = new Set();
+  walk(".", (name) => name === "node_modules" || name.startsWith("."), (path) => {
+    if (!SOURCE.has(extname(path))) return;
+    for (const m of readFileSync(path, "utf8").matchAll(/\bNEXT_PUBLIC_[A-Za-z0-9_]+/g)) names.add(m[0]);
+  });
+  const defined = definedInEnvFiles();
+  for (const name of [...names].sort()) {
+    if (process.env[name] === undefined && !defined.has(name)) console.log(name + "=" + MARK + name + "@@");
+  }
+}
+
+function applyValues() {
+  if (process.env.FORGE_PUBLIC_ENV_APPLIED === "1" || !existsSync(".next")) return;
+  process.env.FORGE_PUBLIC_ENV_APPLIED = "1";
+  const set = new Set();
+  const missing = new Set();
+  let files = 0;
+  const cache = join(".next", "cache");
+  walk(".next", (name, path) => path === cache, (path) => {
+    const bytes = readFileSync(path);
+    if (!bytes.includes(MARK)) return;
+    const text = bytes.toString("latin1").replace(MARKER, (_, name) => {
+      const value = process.env[name];
+      if (value === undefined) {
+        missing.add(name);
+        return "";
+      }
+      set.add(name);
+      return Buffer.from(JSON.stringify(value).slice(1, -1), "utf8").toString("latin1");
+    });
+    writeFileSync(path, Buffer.from(text, "latin1"));
+    files++;
+  });
+  if (files > 0) {
+    const list = (s) => [...s].sort().join(", ") || "none";
+    console.log("forge: applied public configuration to " + files + " files (set: " + list(set) + "; not configured, left empty: " + list(missing) + ")");
+  }
+}
+
+const isMain = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain && process.argv[2] === "--placeholders") {
+  printPlaceholders();
+} else if (!isMain) {
+  try {
+    applyValues();
+  } catch (err) {
+    console.error("forge: could not apply public configuration: " + err.message);
+    process.exit(1);
+  }
+}
+FORGE_PUBLIC_ENV
+
 COPY . .
 
 RUN npm install --no-audit --no-fund
 
-RUN npx --no next build
+RUN env $(node /usr/local/lib/forge/public-env.mjs --placeholders) npx --no next build
 
 # COPY has no conditional form and fails on a missing source, so a
 # directory the runtime stage copies but the repository may not have is
@@ -74,6 +177,20 @@ COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/.next ./.next
 COPY --from=build /app/public ./public
 
+COPY --from=build /usr/local/lib/forge/public-env.mjs /usr/local/lib/forge/public-env.mjs
+
+# The package managers are not used at run time, so they are removed, as in
+# Forge's own runtime images: npm's bundled packages carry findings the image
+# scan blocks on.
+RUN rm -rf /usr/local/lib/node_modules/npm \
+      /usr/local/lib/node_modules/corepack \
+      /usr/local/bin/npm \
+      /usr/local/bin/npx \
+      /usr/local/bin/corepack \
+      /opt/yarn-* \
+      /usr/local/bin/yarn \
+      /usr/local/bin/yarnpkg
+
 EXPOSE 80
 
-CMD ["npx", "--no", "next", "start", "-p", "80"]
+CMD ["node", "--import", "/usr/local/lib/forge/public-env.mjs", "node_modules/.bin/next", "start", "-p", "80"]

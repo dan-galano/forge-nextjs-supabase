@@ -13,5 +13,5 @@
   ],
   "internal_port": 3000,
   "dockerfile_origin": "forge",
-  "dockerfile_sha256": "2027a5aaefa852908d826c7d2639ba082d99fa005ea47a606d15ce233a650a78"
+  "dockerfile_sha256": "3f8c8f7aa5a00151addf327e305f1ffd6144aefca34ff2c3794e0fd1e9678151"
 }
