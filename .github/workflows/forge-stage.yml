@@ -1,0 +1,913 @@
+name: Forge Stage
+
+# Forge Stage — the DEPLOY-ONLY lane (RFC-0108, Task 4.2).
+#
+# This file set belongs to an IMPORTED App: a repository Forge did not
+# scaffold, in an arbitrary language, which ships its OWN Dockerfile. Forge
+# only builds and deploys it. That single fact is what makes this template
+# different from the three managed ones (static, spa/react-vite,
+# ssr/react-router), and it removes exactly two things:
+#
+#  1. gate-checkrun-*. Every managed template opens with a language-specific
+#     static-analysis gate — gate-checkrun-static runs a repo-root index.html
+#     structure check plus HTMLHint/stylelint/linkinator; gate-checkrun-node
+#     runs pnpm install + ESLint + tsc. Neither is RUNNABLE against a
+#     Python/Go/Java/Rust repository: the static one fails its structure check
+#     on a repo with no index.html, and the Node one aborts with
+#     ERR_PNPM_NO_LOCKFILE before a single check runs. Forge cannot infer an
+#     arbitrary repo's lint/typecheck toolchain, and guessing wrong turns a
+#     working import into a permanently red gate. So there is NO checkrun gate
+#     here, and gatelist.go's deploy-only entry omits it in lockstep.
+#
+#  2. The language build step. ssr/react-router's gate-build runs
+#     `npm ci && npm run build` before `docker buildx build`; spa/react-vite
+#     does the same. Here the ONLY build step is `docker buildx build` against
+#     the customer's own Dockerfile, which is by definition self-contained —
+#     if the app needs a compile step, the customer's Dockerfile performs it.
+#     (Note that the static template's gate-build is already docker-only, so
+#     this job is derived from that one rather than invented.)
+#
+# What is NOT removed — and this is the load-bearing half — is everything
+# downstream of the image. gate-scan-deps, gate-scan-secrets, gate-scan-sast,
+# gate-scan-image, gate-sbom and gate-attest are byte-for-byte the managed
+# templates' jobs, because each one is already language-agnostic:
+#
+#   - gate-scan-deps runs `trivy fs` with scanners vuln,misconfig,license,
+#     secret. Trivy's vuln scanner covers go.mod / requirements.txt /
+#     Cargo.toml / pom.xml / package.json alike, and its misconfig scanner
+#     reads Dockerfiles — so on this tier it gains coverage of the customer's
+#     Dockerfile that the managed tiers never needed.
+#   - gate-scan-secrets runs gitleaks over the full git history. Text is text.
+#   - gate-scan-sast runs Opengrep against p/default + p/owasp-top-ten (both
+#     multi-language) plus three JS packs that simply match nothing on a
+#     non-JS tree.
+#   - gate-scan-image, gate-sbom and gate-attest operate on the PUSHED IMAGE
+#     by digest, so the source language is invisible to them.
+#
+# Because the digest / SARIF / manifest.json / upload-artifact plumbing is
+# unchanged, NOTHING downstream of webhook correlation changes for this tier:
+# services/dispatch resolves job names to gate_runs.gate_index through
+# stagetemplates.GateIndexFor exactly as before.
+
+on:
+  push:
+    # mender/** (RFC-0173): Mender pushes a repair to mender/<repair-id> and
+    # Dispatch merges it into the stage branch only when this run passes, so the
+    # gates run there too. No job is guarded by ref: each one is a gate or feeds
+    # one (scan-image, sbom and attest need the pushed image), and the image tag
+    # and signatures are keyed by commit SHA, so a Mender-branch run publishes
+    # nothing the stage-branch run of the same commit would not.
+    branches: [forge/main, 'mender/**']
+  # workflow_dispatch is REQUIRED on this template and is not decoration.
+  # Task 4.8 uses it as the no-pending-edits fallback: an import whose stage
+  # injection produced no commit (every file already byte-identical) fires no
+  # push event, so there would be no stage run to correlate against. A manual
+  # dispatch supplies one.
+  #
+  # Deliberately INPUT-LESS. forge-ci2.yml takes a required release_id because
+  # Dispatch is its only caller and always has one; a stage dispatch may be
+  # triggered with nothing but the ref, and a `required: true` input would make
+  # a bare dispatch impossible. Correlation still works: a dispatch-triggered
+  # run reports head_sha for the ref's current tip, which is the same key the
+  # push lane reports.
+  workflow_dispatch:
+
+concurrency:
+  # Shared with the push lane on purpose: a dispatch and a push on the same ref
+  # would build the same commit twice, so the newer run supersedes the older.
+  group: forge-stage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-1
+  ECR_ACCOUNT_ID: "460589479020"
+  # Stamped per deployment by Dispatch (FORGE_DISPATCH_ENFORCE_FINDINGS). "false"
+  # turns every Findings verdict into a warning; anything else enforces.
+  FORGE_ENFORCE_FINDINGS: "true"
+
+jobs:
+  # NO gate-checkrun-* JOB — see the header. The three source scans
+  # (scan-deps, scan-secrets, scan-sast) therefore have no `needs:` and fan
+  # out in parallel from the start of the run; gate-build joins them.
+  # gate-attest still fans IN from all six upstream jobs, so nothing is
+  # signed unless every gate passed (AD-0006 §4).
+  #
+  # A failed gate stops the pipeline: a CVE, a SAST error or a secret skips
+  # build, scan-image, sbom and attest. The run fails with no manifest (no
+  # View report, no Release) and Blacksmith offers Repair.
+  #
+  # Findings verdict (D-167 / RFC-0160): the gate images always exit 0 when
+  # the scanner ran, by design. The release-blocking verdict lives in each
+  # scan job's final "Findings verdict" step, which reads the job's SARIF
+  # with jq after upload-artifact (so the SARIF is always kept) and fails the
+  # job on: Trivy CVSS >= 7.0 (CRITICAL/HIGH) in scan-deps and scan-image,
+  # any SAST result at level "error" in scan-sast, any gitleaks result in
+  # scan-secrets. MEDIUM/LOW findings never block. The jq rules mirror
+  # pkg/sarif (trivy.go severityBucketFromCVSS, parser.go normalizeSeverity);
+  # the step blocks are byte-identical across the four stage templates.
+  # With FORGE_ENFORCE_FINDINGS "false" (a deployment that does not enforce
+  # findings) each verdict prints the same counts as a warning and passes, so
+  # the pipeline continues and the run can be released with its findings.
+  gate-scan-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Pull gate image
+        # RFC-0146 / D-139: gate images come from this deployment's private ECR,
+        # pulled logged in as the App CI identity, instead of anonymously from ECR
+        # Public, whose per-IP quota shared GitHub runner IPs exhaust.
+        # The credentials live in THIS step's env only and the registry session
+        # is logged out before the step ends, so no later step and no App code
+        # ever holds them (RFC-0064: source-scan gates run without AWS creds).
+        # A public registry value (a deployment without the CI identity's pull
+        # grant) skips the login and pulls anonymously, as before.
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.NMBLR_FOUNDRY_AWS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.NMBLR_FOUNDRY_AWS_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          IMAGE=460589479020.dkr.ecr.us-east-1.amazonaws.com/forge/nmblr/dev/gate-scan-deps:v1.0.0
+          HOST="${IMAGE%%/*}"
+          case "$HOST" in
+            *.dkr.ecr.*.amazonaws.com)
+              REGION="$(echo "$HOST" | cut -d. -f4)"
+              aws ecr get-login-password --region "$REGION" \
+                | docker login --username AWS --password-stdin "$HOST" ;;
+            *) echo "gate registry $HOST is public; pulling anonymously" ;;
+          esac
+          # Retry covers transient network errors.
+          status=125
+          for attempt in 1 2 3; do
+            if docker pull "$IMAGE"; then status=0; break; fi
+            if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
+          done
+          docker logout "$HOST" >/dev/null 2>&1 || true
+          [ "$status" -eq 0 ] || { echo "docker pull failed after 3 attempts"; exit 125; }
+      - name: Run gate-scan-deps
+        run: |
+          set -euo pipefail
+          IMAGE=460589479020.dkr.ecr.us-east-1.amazonaws.com/forge/nmblr/dev/gate-scan-deps:v1.0.0
+          # Pulled by the step above; docker run uses the local image.
+          mkdir -p sarif
+          docker run --rm \
+            -v ${GITHUB_WORKSPACE}:/src:ro \
+            -v ${GITHUB_WORKSPACE}/sarif:/results \
+            -e SCAN_COMMIT_SHA=${GITHUB_SHA} \
+            -e SCAN_REF=${GITHUB_REF} \
+            "$IMAGE"
+      - name: Findings policy
+        # D-177: applies the deployment's findings policy (.forge/findings-policy.json,
+        # evaluated by .forge/findings-policy.jq) to this gate's SARIF before it is
+        # uploaded and judged. A matching result is stamped properties["forge-policy"]
+        # and set to level "warning" (action warn: never blocks) or "error" (action
+        # block: always blocks). An App with no policy file keeps its SARIF as is.
+        run: |
+          set -euo pipefail
+          F=sarif/findings.sarif
+          P=./.forge
+          if [ -s "$F" ] && [ -f "$P/findings-policy.json" ] && [ -f "$P/findings-policy.jq" ]; then
+            jq --slurpfile policy "$P/findings-policy.json" --arg gate scan-deps --arg lane import \
+              -f "$P/findings-policy.jq" "$F" > "$F.policy"
+            mv "$F.policy" "$F"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: sarif-scan-deps
+          path: sarif/findings.sarif
+          retention-days: 90
+      - name: Findings verdict
+        # D-167 / RFC-0160: release-blocking verdict for a Trivy SARIF. A result
+        # blocks when its run's rule carries properties.security-severity >= 7.0
+        # (CRITICAL >= 9.0, HIGH >= 7.0; buckets as pkg/sarif severityBucketFromCVSS).
+        # MEDIUM/LOW never block. No `if:`: runs only when the scan step succeeded,
+        # and a missing or invalid SARIF fails closed. Prints counts only.
+        run: |
+          set -euo pipefail
+          F=sarif/findings.sarif
+          [ -s "$F" ] || { echo "::error::Findings verdict: $F is missing or empty; a scan that ran must leave SARIF"; exit 1; }
+          jq -e 'type == "object"' "$F" >/dev/null 2>&1 || { echo "::error::Findings verdict: $F is not a valid SARIF JSON object"; exit 1; }
+          COUNTS=$(jq -r '
+            [ (.runs // [])[]? | objects
+              | (reduce ((.tool?.driver?.rules? // [])[]? | objects) as $r ({};
+                  if ($r.id | type) == "string" and $r.id != "" then .[$r.id] = $r else . end)) as $rules
+              | (.results // [])[]? | objects
+              | (if (.ruleId | type) == "string" then $rules[.ruleId] else null end) as $rule
+              | ($rule.properties?["security-severity"]? // null) as $raw
+              | (if ($raw | type) == "number" then $raw
+                 elif ($raw | type) == "string" then ($raw | gsub("^\\s+|\\s+$"; "") | if . == "" then null else (tonumber? // null) end)
+                 else null end) as $cvss
+              # D-177: with no CVSS score, the Trivy severity tag decides, so a
+              # HIGH advisory with no score in its database still blocks.
+              | ([ ($rule.properties?.tags? // [])[]? | strings | ascii_upcase
+                   | select(. == "CRITICAL" or . == "HIGH" or . == "MEDIUM" or . == "LOW") ] | first // "NONE") as $sevtag
+              | (if $cvss == null or $cvss <= 0 then $sevtag
+                 elif $cvss >= 9 then "CRITICAL" elif $cvss >= 7 then "HIGH"
+                 elif $cvss >= 4 then "MEDIUM" else "LOW" end) as $bucket
+              # D-177: the findings policy decision overrides the bucket.
+              | (.properties?["forge-policy"]?.action? // "") as $act
+              | if $act == "warn" then "NONE"
+                elif $act == "block" and $bucket != "CRITICAL" then "HIGH"
+                else $bucket end
+            ] as $b
+            | [ "CRITICAL", "HIGH", "MEDIUM", "LOW" ]
+            | map(. as $k | $b | map(select(. == $k)) | length | tostring) | join(" ")
+          ' "$F")
+          read -r CRITICAL HIGH MEDIUM LOW <<<"$COUNTS"
+          SUMMARY="CRITICAL=$CRITICAL HIGH=$HIGH MEDIUM=$MEDIUM LOW=$LOW (CRITICAL/HIGH block; MEDIUM/LOW do not)"
+          if [ $((CRITICAL + HIGH)) -gt 0 ]; then
+            if [ "${FORGE_ENFORCE_FINDINGS:-true}" = "false" ]; then
+              echo "::warning::Findings verdict: not enforced on this deployment, $SUMMARY"
+              exit 0
+            fi
+            echo "::error::Findings verdict: BLOCKED, $SUMMARY"
+            exit 1
+          fi
+          echo "::notice::Findings verdict: passed, $SUMMARY"
+
+  gate-scan-secrets:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth: 0 gives gitleaks the full .git history to scan
+      # (default shallow depth=1 defeats history-based secret detection).
+      # On an imported repo this is the FULL customer history, which is the
+      # point: a secret committed before the import is still a live secret.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Pull gate image
+        # RFC-0146 / D-139: gate images come from this deployment's private ECR,
+        # pulled logged in as the App CI identity, instead of anonymously from ECR
+        # Public, whose per-IP quota shared GitHub runner IPs exhaust.
+        # The credentials live in THIS step's env only and the registry session
+        # is logged out before the step ends, so no later step and no App code
+        # ever holds them (RFC-0064: source-scan gates run without AWS creds).
+        # A public registry value (a deployment without the CI identity's pull
+        # grant) skips the login and pulls anonymously, as before.
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.NMBLR_FOUNDRY_AWS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.NMBLR_FOUNDRY_AWS_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          IMAGE=460589479020.dkr.ecr.us-east-1.amazonaws.com/forge/nmblr/dev/gate-scan-secrets:v1.0.0
+          HOST="${IMAGE%%/*}"
+          case "$HOST" in
+            *.dkr.ecr.*.amazonaws.com)
+              REGION="$(echo "$HOST" | cut -d. -f4)"
+              aws ecr get-login-password --region "$REGION" \
+                | docker login --username AWS --password-stdin "$HOST" ;;
+            *) echo "gate registry $HOST is public; pulling anonymously" ;;
+          esac
+          # Retry covers transient network errors.
+          status=125
+          for attempt in 1 2 3; do
+            if docker pull "$IMAGE"; then status=0; break; fi
+            if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
+          done
+          docker logout "$HOST" >/dev/null 2>&1 || true
+          [ "$status" -eq 0 ] || { echo "docker pull failed after 3 attempts"; exit 125; }
+      - name: Run gate-scan-secrets
+        run: |
+          set -euo pipefail
+          IMAGE=460589479020.dkr.ecr.us-east-1.amazonaws.com/forge/nmblr/dev/gate-scan-secrets:v1.0.0
+          # Pulled by the step above; docker run uses the local image.
+          mkdir -p sarif
+          docker run --rm \
+            -v ${GITHUB_WORKSPACE}:/src:ro \
+            -v ${GITHUB_WORKSPACE}/sarif:/results \
+            -e SCAN_COMMIT_SHA=${GITHUB_SHA} \
+            -e SCAN_REF=${GITHUB_REF} \
+            "$IMAGE"
+      - name: Findings policy
+        # D-177: applies the deployment's findings policy (.forge/findings-policy.json,
+        # evaluated by .forge/findings-policy.jq) to this gate's SARIF before it is
+        # uploaded and judged. A matching result is stamped properties["forge-policy"]
+        # and set to level "warning" (action warn: never blocks) or "error" (action
+        # block: always blocks). An App with no policy file keeps its SARIF as is.
+        run: |
+          set -euo pipefail
+          F=sarif/findings.sarif
+          P=./.forge
+          if [ -s "$F" ] && [ -f "$P/findings-policy.json" ] && [ -f "$P/findings-policy.jq" ]; then
+            jq --slurpfile policy "$P/findings-policy.json" --arg gate scan-secrets --arg lane import \
+              -f "$P/findings-policy.jq" "$F" > "$F.policy"
+            mv "$F.policy" "$F"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: sarif-scan-secrets
+          path: sarif/findings.sarif
+          retention-days: 90
+      - name: Findings verdict
+        # D-167 / RFC-0160: release-blocking verdict for a gitleaks SARIF. Any
+        # result blocks: a leaked secret is critical. No `if:`: runs only when the
+        # scan step succeeded, and a missing or invalid SARIF fails closed.
+        # Prints counts only, never finding text.
+        run: |
+          set -euo pipefail
+          F=sarif/findings.sarif
+          [ -s "$F" ] || { echo "::error::Findings verdict: $F is missing or empty; a scan that ran must leave SARIF"; exit 1; }
+          jq -e 'type == "object"' "$F" >/dev/null 2>&1 || { echo "::error::Findings verdict: $F is not a valid SARIF JSON object"; exit 1; }
+          SECRETS=$(jq -r '
+            [ (.runs // [])[]? | objects | (.results // [])[]? | objects
+              | select((.properties?["forge-policy"]?.action? // "") != "warn") ] | length
+          ' "$F")
+          if [ "$SECRETS" -gt 0 ]; then
+            if [ "${FORGE_ENFORCE_FINDINGS:-true}" = "false" ]; then
+              echo "::warning::Findings verdict: not enforced on this deployment, secrets=$SECRETS (any gitleaks result blocks)"
+              exit 0
+            fi
+            echo "::error::Findings verdict: BLOCKED, secrets=$SECRETS (any gitleaks result blocks)"
+            exit 1
+          fi
+          echo "::notice::Findings verdict: passed, secrets=$SECRETS"
+
+  gate-scan-sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Pull gate image
+        # RFC-0146 / D-139: gate images come from this deployment's private ECR,
+        # pulled logged in as the App CI identity, instead of anonymously from ECR
+        # Public, whose per-IP quota shared GitHub runner IPs exhaust.
+        # The credentials live in THIS step's env only and the registry session
+        # is logged out before the step ends, so no later step and no App code
+        # ever holds them (RFC-0064: source-scan gates run without AWS creds).
+        # A public registry value (a deployment without the CI identity's pull
+        # grant) skips the login and pulls anonymously, as before.
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.NMBLR_FOUNDRY_AWS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.NMBLR_FOUNDRY_AWS_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          IMAGE=460589479020.dkr.ecr.us-east-1.amazonaws.com/forge/nmblr/dev/gate-scan-sast:v1.0.0
+          HOST="${IMAGE%%/*}"
+          case "$HOST" in
+            *.dkr.ecr.*.amazonaws.com)
+              REGION="$(echo "$HOST" | cut -d. -f4)"
+              aws ecr get-login-password --region "$REGION" \
+                | docker login --username AWS --password-stdin "$HOST" ;;
+            *) echo "gate registry $HOST is public; pulling anonymously" ;;
+          esac
+          # Retry covers transient network errors.
+          status=125
+          for attempt in 1 2 3; do
+            if docker pull "$IMAGE"; then status=0; break; fi
+            if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
+          done
+          docker logout "$HOST" >/dev/null 2>&1 || true
+          [ "$status" -eq 0 ] || { echo "docker pull failed after 3 attempts"; exit 125; }
+      - name: Run gate-scan-sast
+        run: |
+          set -euo pipefail
+          IMAGE=460589479020.dkr.ecr.us-east-1.amazonaws.com/forge/nmblr/dev/gate-scan-sast:v1.0.0
+          # Pulled by the step above; docker run uses the local image.
+          mkdir -p sarif
+          docker run --rm \
+            -v ${GITHUB_WORKSPACE}:/src:ro \
+            -v ${GITHUB_WORKSPACE}/sarif:/results \
+            -e SCAN_COMMIT_SHA=${GITHUB_SHA} \
+            -e SCAN_REF=${GITHUB_REF} \
+            "$IMAGE"
+      - name: Findings policy
+        # D-177: applies the deployment's findings policy (.forge/findings-policy.json,
+        # evaluated by .forge/findings-policy.jq) to this gate's SARIF before it is
+        # uploaded and judged. A matching result is stamped properties["forge-policy"]
+        # and set to level "warning" (action warn: never blocks) or "error" (action
+        # block: always blocks). An App with no policy file keeps its SARIF as is.
+        run: |
+          set -euo pipefail
+          F=sarif/findings.sarif
+          P=./.forge
+          if [ -s "$F" ] && [ -f "$P/findings-policy.json" ] && [ -f "$P/findings-policy.jq" ]; then
+            jq --slurpfile policy "$P/findings-policy.json" --arg gate scan-sast --arg lane import \
+              -f "$P/findings-policy.jq" "$F" > "$F.policy"
+            mv "$F.policy" "$F"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: sarif-scan-sast
+          path: sarif/findings.sarif
+          retention-days: 90
+      - name: Findings verdict
+        # D-167 / RFC-0160: release-blocking verdict for an Opengrep SARIF. A
+        # result blocks when its own level is "error" (results[].level only, as
+        # pkg/sarif normalizeSeverity; a missing level counts as note). warning
+        # and note never block. No `if:`: runs only when the scan step succeeded,
+        # and a missing or invalid SARIF fails closed. Prints counts only.
+        run: |
+          set -euo pipefail
+          F=sarif/findings.sarif
+          [ -s "$F" ] || { echo "::error::Findings verdict: $F is missing or empty; a scan that ran must leave SARIF"; exit 1; }
+          jq -e 'type == "object"' "$F" >/dev/null 2>&1 || { echo "::error::Findings verdict: $F is not a valid SARIF JSON object"; exit 1; }
+          COUNTS=$(jq -r '
+            [ (.runs // [])[]? | objects | (.results // [])[]? | objects
+              | (.level // "") | (if type == "string" then ascii_downcase | gsub("^\\s+|\\s+$"; "") else "" end)
+              | if . == "error" or . == "warning" then . else "note" end
+            ] as $l
+            | [ "error", "warning", "note" ]
+            | map(. as $k | $l | map(select(. == $k)) | length | tostring) | join(" ")
+          ' "$F")
+          read -r ERRORS WARNINGS NOTES <<<"$COUNTS"
+          SUMMARY="error=$ERRORS warning=$WARNINGS note=$NOTES (error blocks; warning/note do not)"
+          if [ "$ERRORS" -gt 0 ]; then
+            if [ "${FORGE_ENFORCE_FINDINGS:-true}" = "false" ]; then
+              echo "::warning::Findings verdict: not enforced on this deployment, $SUMMARY"
+              exit 0
+            fi
+            echo "::error::Findings verdict: BLOCKED, $SUMMARY"
+            exit 1
+          fi
+          echo "::notice::Findings verdict: passed, $SUMMARY"
+
+  gate-build:
+    needs: [gate-scan-deps, gate-scan-secrets, gate-scan-sast]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image_ref: ${{ steps.build-image.outputs.image_ref }}
+      image_digest: ${{ steps.build-image.outputs.image_digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # NO setup-node, NO dependency install, NO framework build. The customer's
+      # Dockerfile is the entire build definition for this tier; Forge does not
+      # know (and must not guess) the repo's language or package manager.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          aws-access-key-id: ${{ secrets.NMBLR_FOUNDRY_AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.NMBLR_FOUNDRY_AWS_SECRET_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Parse App Name Slug
+        id: app-info
+        # Kept byte-identical to the managed templates so gate-build,
+        # gate-attest and forge-deploy.yml all derive the SAME ECR repository
+        # name. On an imported repo the `forge.app.` prefix is absent, so the
+        # sed is a no-op and APP_NAME is the customer's own repo name — which is
+        # self-consistent across all three derivation sites.
+        run: |
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          APP_NAME=$(echo "$REPO_NAME" | sed 's/forge\.app\.//')
+          echo "APP_NAME=$APP_NAME" >> $GITHUB_ENV
+          echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+        with:
+          registries: ${{ env.ECR_ACCOUNT_ID }}
+      - name: Bootstrap ECR Repository
+        # Stage owns ECR repo bootstrap (RFC-0064): gate-build is the first
+        # step that pushes; deploy just pulls by digest and no longer needs
+        # to create the repo. Kept idempotent (describe-or-create).
+        run: |
+          REPO_NAME="forge.app.${{ env.APP_NAME }}"
+          if ! aws ecr describe-repositories --repository-names "$REPO_NAME" --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+            echo "Creating ECR Repository $REPO_NAME..."
+            aws ecr create-repository --repository-name "$REPO_NAME" --region ${{ env.AWS_REGION }}
+          else
+            echo "ECR Repository $REPO_NAME already exists."
+          fi
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Build and push image from the customer's Dockerfile
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          COMMIT_SHA="${GITHUB_SHA}"
+          IMAGE_TAG="${COMMIT_SHA}"
+          IMAGE_REPO="${ECR_REGISTRY}/forge.app.${{ env.APP_NAME }}"
+          # The build context is the repo root and the Dockerfile is whatever
+          # the customer committed at ./Dockerfile — Forge NEVER writes that
+          # file for this tier (pkg/stagetemplates classifies it CustomerOwned,
+          # and this template's file-set does not even carry one).
+          #
+          # amd64 ONLY, deliberately. Fargate defaults to X86_64 when a task
+          # definition declares no runtimePlatform, which is what forge-deploy
+          # registers — so the arm64 half of a multi-arch build was never pulled,
+          # and it was built under QEMU emulation on x86 runners, which is
+          # 10-50x slower. Building an architecture nothing deploys, at
+          # emulation cost, is the worst of both.
+          #
+          # To go arm64 later (Graviton is ~20% cheaper per vCPU-hour): set
+          # runtimePlatform.cpuArchitecture=ARM64 in forge-deploy.yml AND build
+          # on an arm64 runner — emulation would just move the cost into CI.
+          #
+          # A customer Dockerfile that declares its own --platform or targets a
+          # different architecture is the one failure mode unique to this tier;
+          # it surfaces here as a build/deploy mismatch rather than silently.
+          #
+          # --iidfile records the image digest (buildx >= 0.10,
+          # docker/buildx#1533). That digest is what cosign signs downstream;
+          # --push publishes the manifest under the tag.
+          docker buildx build \
+            --platform linux/amd64 \
+            --push \
+            -t "${IMAGE_REPO}:${IMAGE_TAG}" \
+            --iidfile image_digest.txt \
+            .
+          DIGEST=$(cat image_digest.txt)
+          IMAGE_REF="${IMAGE_REPO}@${DIGEST}"
+          echo "${IMAGE_REF}" > image_ref.txt
+          echo "image_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${IMAGE_REF}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-bundle
+          path: |
+            image_digest.txt
+            image_ref.txt
+          retention-days: 90
+
+  gate-scan-image:
+    needs: [gate-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Configure AWS credentials
+        # Only gate-scan-image + gate-sbom receive AWS creds; source-scan
+        # gates run without them (RFC-0064 §Security Considerations). Creds
+        # are needed so the containerized trivy scanner can pull the app
+        # image from private ECR by digest. (Every gate job's "Pull gate image"
+        # step also holds creds, scoped to that one step and logged out before
+        # it ends — RFC-0146 — so the source-scan jobs still never carry them.)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          aws-access-key-id: ${{ secrets.NMBLR_FOUNDRY_AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.NMBLR_FOUNDRY_AWS_SECRET_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: build-bundle
+      - name: Pull gate image
+        # RFC-0146 / D-139: gate images come from this deployment's private ECR,
+        # pulled logged in as the App CI identity, instead of anonymously from ECR
+        # Public, whose per-IP quota shared GitHub runner IPs exhaust.
+        # The credentials live in THIS step's env only and the registry session
+        # is logged out before the step ends, so no later step and no App code
+        # ever holds them (RFC-0064: source-scan gates run without AWS creds).
+        # A public registry value (a deployment without the CI identity's pull
+        # grant) skips the login and pulls anonymously, as before.
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.NMBLR_FOUNDRY_AWS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.NMBLR_FOUNDRY_AWS_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          IMAGE=460589479020.dkr.ecr.us-east-1.amazonaws.com/forge/nmblr/dev/gate-scan-image:v1.0.0
+          HOST="${IMAGE%%/*}"
+          case "$HOST" in
+            *.dkr.ecr.*.amazonaws.com)
+              REGION="$(echo "$HOST" | cut -d. -f4)"
+              aws ecr get-login-password --region "$REGION" \
+                | docker login --username AWS --password-stdin "$HOST" ;;
+            *) echo "gate registry $HOST is public; pulling anonymously" ;;
+          esac
+          # Retry covers transient network errors.
+          status=125
+          for attempt in 1 2 3; do
+            if docker pull "$IMAGE"; then status=0; break; fi
+            if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
+          done
+          docker logout "$HOST" >/dev/null 2>&1 || true
+          [ "$status" -eq 0 ] || { echo "docker pull failed after 3 attempts"; exit 125; }
+      - name: Run gate-scan-image
+        run: |
+          set -euo pipefail
+          IMAGE=460589479020.dkr.ecr.us-east-1.amazonaws.com/forge/nmblr/dev/gate-scan-image:v1.0.0
+          # Pulled by the step above; docker run uses the local image.
+          IMAGE_REF=$(cat image_ref.txt)
+          mkdir -p sarif-results
+          docker run --rm \
+            -e SCAN_IMAGE_REF="${IMAGE_REF}" \
+            -e SCAN_COMMIT_SHA=${GITHUB_SHA} \
+            -e AWS_ACCESS_KEY_ID \
+            -e AWS_SECRET_ACCESS_KEY \
+            -e AWS_SESSION_TOKEN \
+            -e AWS_REGION \
+            -v ${GITHUB_WORKSPACE}/sarif-results:/results \
+            "$IMAGE"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        # The findings policy step below reads the App's two policy files; this
+        # job scans the pushed image and has no checkout of its own. A separate
+        # path keeps checkout's clean from touching the scan's SARIF.
+        with:
+          path: .forge-policy
+          sparse-checkout: |
+            .forge/findings-policy.json
+            .forge/findings-policy.jq
+          sparse-checkout-cone-mode: false
+      - name: Findings policy
+        # D-177: applies the deployment's findings policy (.forge/findings-policy.json,
+        # evaluated by .forge/findings-policy.jq) to this gate's SARIF before it is
+        # uploaded and judged. A matching result is stamped properties["forge-policy"]
+        # and set to level "warning" (action warn: never blocks) or "error" (action
+        # block: always blocks). An App with no policy file keeps its SARIF as is.
+        run: |
+          set -euo pipefail
+          F=sarif-results/findings.sarif
+          P=.forge-policy/.forge
+          if [ -s "$F" ] && [ -f "$P/findings-policy.json" ] && [ -f "$P/findings-policy.jq" ]; then
+            jq --slurpfile policy "$P/findings-policy.json" --arg gate scan-image --arg lane import \
+              -f "$P/findings-policy.jq" "$F" > "$F.policy"
+            mv "$F.policy" "$F"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: sarif-scan-image
+          path: sarif-results/findings.sarif
+          retention-days: 90
+      - name: Findings verdict
+        # D-167 / RFC-0160: release-blocking verdict for a Trivy SARIF. A result
+        # blocks when its run's rule carries properties.security-severity >= 7.0
+        # (CRITICAL >= 9.0, HIGH >= 7.0; buckets as pkg/sarif severityBucketFromCVSS).
+        # MEDIUM/LOW never block. No `if:`: runs only when the scan step succeeded,
+        # and a missing or invalid SARIF fails closed. Prints counts only.
+        run: |
+          set -euo pipefail
+          F=sarif-results/findings.sarif
+          [ -s "$F" ] || { echo "::error::Findings verdict: $F is missing or empty; a scan that ran must leave SARIF"; exit 1; }
+          jq -e 'type == "object"' "$F" >/dev/null 2>&1 || { echo "::error::Findings verdict: $F is not a valid SARIF JSON object"; exit 1; }
+          COUNTS=$(jq -r '
+            [ (.runs // [])[]? | objects
+              | (reduce ((.tool?.driver?.rules? // [])[]? | objects) as $r ({};
+                  if ($r.id | type) == "string" and $r.id != "" then .[$r.id] = $r else . end)) as $rules
+              | (.results // [])[]? | objects
+              | (if (.ruleId | type) == "string" then $rules[.ruleId] else null end) as $rule
+              | ($rule.properties?["security-severity"]? // null) as $raw
+              | (if ($raw | type) == "number" then $raw
+                 elif ($raw | type) == "string" then ($raw | gsub("^\\s+|\\s+$"; "") | if . == "" then null else (tonumber? // null) end)
+                 else null end) as $cvss
+              # D-177: with no CVSS score, the Trivy severity tag decides, so a
+              # HIGH advisory with no score in its database still blocks.
+              | ([ ($rule.properties?.tags? // [])[]? | strings | ascii_upcase
+                   | select(. == "CRITICAL" or . == "HIGH" or . == "MEDIUM" or . == "LOW") ] | first // "NONE") as $sevtag
+              | (if $cvss == null or $cvss <= 0 then $sevtag
+                 elif $cvss >= 9 then "CRITICAL" elif $cvss >= 7 then "HIGH"
+                 elif $cvss >= 4 then "MEDIUM" else "LOW" end) as $bucket
+              # D-177: the findings policy decision overrides the bucket.
+              | (.properties?["forge-policy"]?.action? // "") as $act
+              | if $act == "warn" then "NONE"
+                elif $act == "block" and $bucket != "CRITICAL" then "HIGH"
+                else $bucket end
+            ] as $b
+            | [ "CRITICAL", "HIGH", "MEDIUM", "LOW" ]
+            | map(. as $k | $b | map(select(. == $k)) | length | tostring) | join(" ")
+          ' "$F")
+          read -r CRITICAL HIGH MEDIUM LOW <<<"$COUNTS"
+          SUMMARY="CRITICAL=$CRITICAL HIGH=$HIGH MEDIUM=$MEDIUM LOW=$LOW (CRITICAL/HIGH block; MEDIUM/LOW do not)"
+          if [ $((CRITICAL + HIGH)) -gt 0 ]; then
+            if [ "${FORGE_ENFORCE_FINDINGS:-true}" = "false" ]; then
+              echo "::warning::Findings verdict: not enforced on this deployment, $SUMMARY"
+              exit 0
+            fi
+            echo "::error::Findings verdict: BLOCKED, $SUMMARY"
+            exit 1
+          fi
+          echo "::notice::Findings verdict: passed, $SUMMARY"
+
+  gate-sbom:
+    needs: [gate-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          aws-access-key-id: ${{ secrets.NMBLR_FOUNDRY_AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.NMBLR_FOUNDRY_AWS_SECRET_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: build-bundle
+      - name: Pull gate image
+        # RFC-0146 / D-139: gate images come from this deployment's private ECR,
+        # pulled logged in as the App CI identity, instead of anonymously from ECR
+        # Public, whose per-IP quota shared GitHub runner IPs exhaust.
+        # The credentials live in THIS step's env only and the registry session
+        # is logged out before the step ends, so no later step and no App code
+        # ever holds them (RFC-0064: source-scan gates run without AWS creds).
+        # A public registry value (a deployment without the CI identity's pull
+        # grant) skips the login and pulls anonymously, as before.
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.NMBLR_FOUNDRY_AWS_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.NMBLR_FOUNDRY_AWS_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          IMAGE=460589479020.dkr.ecr.us-east-1.amazonaws.com/forge/nmblr/dev/gate-sbom:v1.0.0
+          HOST="${IMAGE%%/*}"
+          case "$HOST" in
+            *.dkr.ecr.*.amazonaws.com)
+              REGION="$(echo "$HOST" | cut -d. -f4)"
+              aws ecr get-login-password --region "$REGION" \
+                | docker login --username AWS --password-stdin "$HOST" ;;
+            *) echo "gate registry $HOST is public; pulling anonymously" ;;
+          esac
+          # Retry covers transient network errors.
+          status=125
+          for attempt in 1 2 3; do
+            if docker pull "$IMAGE"; then status=0; break; fi
+            if [ "$attempt" -lt 3 ]; then sleep $((attempt * 10)); fi
+          done
+          docker logout "$HOST" >/dev/null 2>&1 || true
+          [ "$status" -eq 0 ] || { echo "docker pull failed after 3 attempts"; exit 125; }
+      - name: Run gate-sbom
+        run: |
+          set -euo pipefail
+          IMAGE=460589479020.dkr.ecr.us-east-1.amazonaws.com/forge/nmblr/dev/gate-sbom:v1.0.0
+          # Pulled by the step above; docker run uses the local image.
+          IMAGE_REF=$(cat image_ref.txt)
+          mkdir -p sbom-results
+          docker run --rm \
+            -e SCAN_IMAGE_REF="${IMAGE_REF}" \
+            -e AWS_ACCESS_KEY_ID \
+            -e AWS_SECRET_ACCESS_KEY \
+            -e AWS_SESSION_TOKEN \
+            -e AWS_REGION \
+            -v ${GITHUB_WORKSPACE}/sbom-results:/results \
+            "$IMAGE"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: sbom
+          path: sbom-results/
+          retention-days: 90
+
+  gate-attest:
+    # Fans in from all six upstream gates — identical to the managed templates,
+    # which never listed gate-checkrun-* here either (it reached this job
+    # transitively). Removing the checkrun gate therefore left this list
+    # untouched: any gate failure still fails the sign step closed (AD-0006 §4).
+    needs: [gate-scan-deps, gate-scan-secrets, gate-scan-sast, gate-scan-image, gate-sbom, gate-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write        # required by cosign for keyless OIDC signing
+    outputs:
+      manifest_uploaded: ${{ steps.upload.outcome == 'success' }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: build-bundle
+          path: ./_build
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sbom
+          path: ./_sbom
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sarif-scan-image
+          path: ./_scan
+      - id: meta
+        name: Derive build metadata
+        run: |
+          set -euo pipefail
+          IMAGE_REF=$(cat ./_build/image_ref.txt)
+          IMAGE_DIGEST=$(cat ./_build/image_digest.txt)
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          BUILD_REF="${GITHUB_REF_NAME}-${GITHUB_RUN_NUMBER}.${SHORT_SHA}"
+          BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          # Re-derive APP_NAME here — $GITHUB_ENV from gate-build's app-info
+          # step is job-local; gate-attest is a separate job.
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          APP_NAME=$(echo "$REPO_NAME" | sed 's/forge\.app\.//')
+          echo "APP_NAME=$APP_NAME" >> "$GITHUB_ENV"
+          {
+            echo "image_ref=${IMAGE_REF}"
+            echo "image_digest=${IMAGE_DIGEST}"
+            echo "build_ref=${BUILD_REF}"
+            echo "built_at=${BUILT_AT}"
+          } >> "$GITHUB_OUTPUT"
+      # cosign sign publishes the signature as an OCI referrer alongside the
+      # image manifest in ECR, which requires ECR push credentials — cosign
+      # keyless OIDC only signs, it does NOT authenticate to the destination
+      # registry. Configure AWS creds + ECR login BEFORE cosign runs so the
+      # PUT /v2/.../manifests/sha256:... calls carry a valid bearer token.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          aws-access-key-id: ${{ secrets.NMBLR_FOUNDRY_AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.NMBLR_FOUNDRY_AWS_SECRET_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+        with:
+          registries: ${{ env.ECR_ACCOUNT_ID }}
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - id: sign
+        name: Sign image + attest SBOM + attest scan (cosign keyless OIDC)
+        env:
+          IMAGE_REF: ${{ steps.meta.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          # cosign sign publishes the signature as an OCI referrer alongside
+          # the image manifest in ECR (RFC-0064). Unlike sign-blob, there is
+          # no sidecar bundle file — the transparency log entry lives in the
+          # registry referrers index and is looked up via `cosign tree`.
+          cosign sign --yes "${IMAGE_REF}"
+          # SPDX SBOM attestation — cosign's --type spdxjson alias maps to
+          # the in-toto SPDX JSON predicate type. TASK-0029's OPA gate reads
+          # this attestation to enforce SBOM presence at deploy time.
+          cosign attest --yes --predicate ./_sbom/sbom.spdx.json --type spdxjson "${IMAGE_REF}"
+          # Vulnerability scan attestation — --type vuln alias maps to the
+          # in-toto vulnerability predicate type (SARIF payload).
+          cosign attest --yes --predicate ./_scan/findings.sarif --type vuln "${IMAGE_REF}"
+      - id: manifest
+        name: Emit manifest.json
+        env:
+          IMAGE_REF: ${{ steps.meta.outputs.image_ref }}
+          IMAGE_DIGEST: ${{ steps.meta.outputs.image_digest }}
+        run: |
+          set -euo pipefail
+          # SBOM digest + package_count from the sbom artifact (meta.json is
+          # written inline by gate-sbom's entrypoint — see containers/gate-sbom).
+          SBOM_DIGEST="sha256:$(sha256sum ./_sbom/sbom.spdx.json | cut -d' ' -f1)"
+          PACKAGE_COUNT=$(jq -r '.package_count // 0' ./_sbom/meta.json 2>/dev/null || echo 0)
+          # SARIF digest + severity counts. Trivy encodes severity on the
+          # matched rule (runs[].tool.driver.rules[].properties.tags contains
+          # "CRITICAL"|"HIGH"|"MEDIUM"|"LOW"); results[] reference the rule
+          # by ruleIndex. Best-effort — zeros on parse failure; the summary
+          # block is informational (TASK-0029 re-parses SARIF authoritatively).
+          SCAN_DIGEST="sha256:$(sha256sum ./_scan/findings.sarif | cut -d' ' -f1)"
+          count_severity() {
+            local sev="$1"
+            jq -r --arg sev "$sev" '
+              [ .runs[]?
+                | . as $run
+                | .results[]?
+                | ($run.tool.driver.rules[.ruleIndex // 0].properties.tags // [])
+                | map(ascii_upcase)
+                | select(index($sev))
+              ] | length
+            ' ./_scan/findings.sarif 2>/dev/null || echo 0
+          }
+          CRITICAL=$(count_severity CRITICAL); CRITICAL=${CRITICAL:-0}
+          HIGH=$(count_severity HIGH); HIGH=${HIGH:-0}
+          MEDIUM=$(count_severity MEDIUM); MEDIUM=${MEDIUM:-0}
+          LOW=$(count_severity LOW); LOW=${LOW:-0}
+          echo "SARIF summary: critical=$CRITICAL high=$HIGH medium=$MEDIUM low=$LOW"
+          # verify_hint uses `cosign tree` because for image-sign the
+          # signature + attestations live as OCI referrers, not a sidecar
+          # bundle. `cosign tree` enumerates them for the given image ref.
+          VERIFY_HINT="cosign tree ${IMAGE_REF}"
+          # oidc_identity is the exact OIDC subject the keyless signing cert
+          # carries — the value a strict `cosign verify --certificate-identity`
+          # consumer needs. GHA sets GITHUB_WORKFLOW_REF to
+          # `{owner}/{repo}/.github/workflows/{file}.yml@{ref}` — prefixing
+          # with `https://github.com/` yields the SAN identity Fulcio issued.
+          OIDC_IDENTITY="https://github.com/${GITHUB_WORKFLOW_REF}"
+          cat > manifest.json <<EOF
+          {
+            "schema_version": 3,
+            "app_template": "deploy-only",
+            "commit_sha": "${GITHUB_SHA}",
+            "build_ref": "${{ steps.meta.outputs.build_ref }}",
+            "built_at": "${{ steps.meta.outputs.built_at }}",
+            "run_id": ${GITHUB_RUN_ID},
+            "run_number": ${GITHUB_RUN_NUMBER},
+            "artifact": {
+              "kind": "oci-image",
+              "name": "forge.app.${{ env.APP_NAME }}",
+              "size_bytes": 0,
+              "digest": "${IMAGE_DIGEST}"
+            },
+            "attestation": {
+              "kind": "cosign-sigstore",
+              "signature_bundle": "",
+              "rekor_log_index": "",
+              "oidc_identity": "${OIDC_IDENTITY}",
+              "verify_hint": "${VERIFY_HINT}"
+            },
+            "sbom": {
+              "format": "spdx-json",
+              "path": "sbom.spdx.json",
+              "digest": "${SBOM_DIGEST}",
+              "package_count": ${PACKAGE_COUNT}
+            },
+            "image_scan": {
+              "scanner": "trivy",
+              "format": "sarif",
+              "path": "findings.sarif",
+              "digest": "${SCAN_DIGEST}",
+              "summary": {
+                "critical": ${CRITICAL},
+                "high": ${HIGH},
+                "medium": ${MEDIUM},
+                "low": ${LOW}
+              }
+            },
+            "release": { "tag": null }
+          }
+          EOF
+      - id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: manifest
+          path: manifest.json
+          retention-days: 90

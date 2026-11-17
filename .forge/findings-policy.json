@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "name": "forge-framework-versions",
+      "kind": "vulnerability",
+      "packages": [
+        "react-router",
+        "@react-router/*"
+      ],
+      "action": "warn",
+      "reason": "Forge-pinned framework version; it is updated with the template"
+    },
+    {
+      "name": "forge-deploy-stack",
+      "kind": "misconfiguration",
+      "files": [
+        ".forge/**"
+      ],
+      "action": "warn",
+      "reason": "Forge's deploy stack; it is updated with the template"
+    },
+    {
+      "name": "imported-dockerfile",
+      "kind": "misconfiguration",
+      "lane": "import",
+      "files": [
+        "Dockerfile"
+      ],
+      "action": "warn",
+      "reason": "The imported App's Dockerfile is yours to change"
+    }
+  ]
+}

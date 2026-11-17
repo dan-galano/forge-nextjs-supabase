@@ -1,0 +1,362 @@
+name: forge-unpublish-ecs
+
+# Forge Container Unpublish — takes one environment of an ECS App offline,
+# executed IN THE APP REPO (RFC-0185 DD-4, Decision Register row D-271).
+#
+# This workflow runs `tofu destroy` against the SAME per-(App, env) state key,
+# with the SAME backend settings, the SAME provider file and the SAME
+# repository secrets as forge-deploy-ecs.yml. Dispatch dispatches it and
+# correlates the run; the `workflow_run` completion webhook (and Dispatch's
+# unpublish reconciler) is the contract. **Exit status is the whole contract.**
+#
+# # Why this is a separate file, and never a field on the deploy spec
+#
+# An `unpublish: true` field on forge-deploy-ecs.yml's spec would FAIL OPEN:
+# that workflow, like every Forge deploy workflow, ignores unknown optional
+# fields, so a repo staged before RFC-0185 would read the request as a deploy,
+# run `tofu apply`, and REDEPLOY the environment it was asked to take down.
+# A new file fails safe instead: dispatching a workflow GitHub has not
+# registered answers 404, and nothing runs.
+#
+# The file is dispatch-only (its one trigger is `workflow_dispatch`), so
+# pkg/stagetemplates DispatchOnlyWorkflows keeps it, and Dispatch can install
+# it on an older repo's default branch (by PR + merge, RFC-0185 X5) without
+# that install starting anything by itself.
+#
+# # Idempotent by construction
+#
+# `tofu destroy` against a state that holds nothing (never deployed, or a
+# previous unpublish already finished) is a successful no-op, and a run that
+# died half-way leaves a smaller state that the next run finishes. A retry is
+# therefore always safe. The run shares forge-deploy-ecs.yml's concurrency
+# group, so a destroy and an apply on one repo are serialized by GitHub and
+# never race on the state lock.
+#
+# # What the spec carries (RFC-0185 P-1)
+#
+# `tofu destroy` still evaluates the root module's variables, so the spec
+# carries the backend settings plus the module's 14 required inputs, rendered
+# by Dispatch from the release being taken offline and the deployment's
+# substrate. It carries NO capability bindings, sidecars or App Configuration:
+# the tfvars below write all three as empty lists, and every optional input
+# keeps its module default. A destroy works from state, so none of those
+# values changes what is destroyed.
+#
+# # The tofu module
+#
+# `.forge/deploy/ecs/*.tf` is the VENDORED copy of `deploy/apps/modules/ecs`
+# the deploy workflow applies. This workflow destroys exactly what that module
+# created: the ECS service, task definition, target group, listener rule and
+# the App's log group (RFC-0185 Decision 11: the logs go with it). The image
+# in the registry and the git history are untouched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      spec:
+        description: >-
+          Single JSON unpublish spec minted by Dispatch (spec_version 1,
+          operation "unpublish"). Read through an env var, never interpolated
+          into a shell body. Carries the per-(App, env) tofu backend settings
+          and the ecs module's required inputs, and no capability binding of
+          any kind.
+        required: true
+        type: string
+
+concurrency:
+  # The SAME group as forge-deploy-ecs.yml, on purpose (RFC-0185 P-11a):
+  # GitHub serializes every run in one group across workflows, so an unpublish
+  # waits for an in-flight deploy (and the reverse) instead of contending for
+  # the S3 lockfile. Never cancel-in-progress: a cancelled `tofu destroy` can
+  # strand the lockfile and leave the service half torn down.
+  group: forge-deploy-ecs-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  # Read-only, and deliberately NOTHING else — the same posture as the deploy
+  # workflow. The AWS credentials are permanent org-level access keys.
+  contents: read
+
+env:
+  # Lockstep with forge-deploy-ecs.yml (and the forge repo's CI pin). >= 1.10
+  # is a hard floor: `use_lockfile` did not exist before it.
+  TOFU_VERSION: "1.10.0"
+  # The vendored module + all generated files. tofu runs with this as its cwd.
+  TF_WORKDIR: .forge/deploy/ecs
+
+jobs:
+  unpublish-ecs:
+    name: Unpublish from ECS (Fargate)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # -----------------------------------------------------------------------
+      # 1. Parse the spec.
+      # -----------------------------------------------------------------------
+      #
+      # SPEC_JSON is read through an env var and never through `${{ }}` inside
+      # the script body: `${{ }}` substitution happens BEFORE the shell sees the
+      # line, so an interpolated value is shell source.
+      #
+      # Everything that can fail on the SHAPE of the spec fails here, before the
+      # credentials step, so a malformed dispatch costs zero AWS calls and names
+      # the offending field.
+      - name: Parse unpublish spec
+        env:
+          SPEC_JSON: ${{ inputs.spec }}
+        run: |
+          set -euo pipefail
+
+          # Version AND operation are both equality tests. A deploy spec handed
+          # to this workflow (no `operation`) is refused rather than read as a
+          # takedown, and a future spec version is refused rather than half
+          # understood.
+          SPEC_VERSION="$(jq -r '.spec_version // empty' <<< "$SPEC_JSON")"
+          if [ "$SPEC_VERSION" != "1" ]; then
+            echo "::error::unsupported spec_version '${SPEC_VERSION}' — this workflow understands version 1. Re-stage the app to pick up a newer workflow." >&2
+            exit 1
+          fi
+          OPERATION="$(jq -r '.operation // empty' <<< "$SPEC_JSON")"
+          if [ "$OPERATION" != "unpublish" ]; then
+            echo "::error::spec operation '${OPERATION}' is not 'unpublish' — this workflow only takes an environment offline. Re-stage the app to pick up a newer workflow." >&2
+            exit 1
+          fi
+
+          # put() refuses embedded newlines: a newline in a value would let a
+          # crafted spec field define ADDITIONAL environment variables through
+          # $GITHUB_ENV. Same guard as forge-deploy-ecs.yml.
+          put() {
+            local key="$1" val="$2"
+            case "$val" in
+              *$'\n'*)
+                echo "::error::spec field ${key} contains a newline — refusing" >&2
+                exit 1
+                ;;
+            esac
+            printf '%s=%s\n' "$key" "$val" >> "$GITHUB_ENV"
+          }
+
+          require() {
+            local key="$1" val="$2"
+            if [ -z "$val" ]; then
+              echo "::error::spec field ${key} is required and empty" >&2
+              exit 1
+            fi
+          }
+
+          require_list() {
+            local key="$1" n
+            n="$(jq -r --arg k "$key" '(.[$k] // []) | length' <<< "$SPEC_JSON")"
+            if [ "$n" -lt 1 ]; then
+              echo "::error::spec field ${key} must be a non-empty array" >&2
+              exit 1
+            fi
+          }
+
+          APP_ID="$(jq -r '.app_id // ""' <<< "$SPEC_JSON")"
+          APP_SLUG="$(jq -r '.app_slug // ""' <<< "$SPEC_JSON")"
+          DEPLOY_ENV="$(jq -r '.env // ""' <<< "$SPEC_JSON")"
+          RELEASE_ID="$(jq -r '.release_id // ""' <<< "$SPEC_JSON")"
+          AWS_REGION="$(jq -r '.aws_region // ""' <<< "$SPEC_JSON")"
+          IMAGE_DIGEST="$(jq -r '.image_digest // ""' <<< "$SPEC_JSON")"
+          STATE_BUCKET="$(jq -r '.state_bucket // ""' <<< "$SPEC_JSON")"
+          STATE_KEY="$(jq -r '.state_key // ""' <<< "$SPEC_JSON")"
+          STATE_REGION="$(jq -r '.state_region // ""' <<< "$SPEC_JSON")"
+          STATE_KMS_KEY_ID="$(jq -r '.state_kms_key_id // ""' <<< "$SPEC_JSON")"
+          USE_LOCKFILE="$(jq -r 'if .use_lockfile == false then "false" else "true" end' <<< "$SPEC_JSON")"
+
+          require app_id "$APP_ID"
+          require app_slug "$APP_SLUG"
+          require env "$DEPLOY_ENV"
+          require aws_region "$AWS_REGION"
+          require image_digest "$IMAGE_DIGEST"
+          require state_bucket "$STATE_BUCKET"
+          require state_key "$STATE_KEY"
+          require state_region "$STATE_REGION"
+
+          # The rest of the module's 14 required inputs. They are consumed only
+          # by the tfvars projection, but a destroy still evaluates every
+          # variable's validation, so an empty one fails here with its name
+          # instead of as a tofu variable error three steps later.
+          require ecr_registry "$(jq -r '.ecr_registry // ""' <<< "$SPEC_JSON")"
+          require ecr_repo "$(jq -r '.ecr_repo // ""' <<< "$SPEC_JSON")"
+          require cluster_arn "$(jq -r '.cluster_arn // ""' <<< "$SPEC_JSON")"
+          require task_exec_role_arn "$(jq -r '.task_exec_role_arn // ""' <<< "$SPEC_JSON")"
+          require task_role_arn "$(jq -r '.task_role_arn // ""' <<< "$SPEC_JSON")"
+          require alb_listener_arn "$(jq -r '.alb_listener_arn // ""' <<< "$SPEC_JSON")"
+          require vpc_id "$(jq -r '.vpc_id // ""' <<< "$SPEC_JSON")"
+          require parent_zone "$(jq -r '.parent_zone // ""' <<< "$SPEC_JSON")"
+          require_list security_group_ids
+          require_list subnet_ids
+
+          # Narrower than the deploy workflow on purpose: RFC-0185 takes
+          # Staging and Production (internal_prod) offline, and public_prod is
+          # out of its scope (Dispatch answers 400). A hand-dispatched spec
+          # cannot reach further than the feature does.
+          case "$DEPLOY_ENV" in
+            staging|internal_prod) ;;
+            *)
+              echo "::error::env '${DEPLOY_ENV}' is not one of staging|internal_prod — only those environments can be unpublished" >&2
+              exit 1
+              ;;
+          esac
+
+          # The module's image_digest validation still runs on destroy; this
+          # cheaper guard names the rule.
+          case "$IMAGE_DIGEST" in
+            sha256:*) ;;
+            *)
+              echo "::error::image_digest '${IMAGE_DIGEST}' must be of the form sha256:<hex>" >&2
+              exit 1
+              ;;
+          esac
+
+          put APP_ID "$APP_ID"
+          put APP_SLUG "$APP_SLUG"
+          put DEPLOY_ENV "$DEPLOY_ENV"
+          put RELEASE_ID "$RELEASE_ID"
+          put APP_AWS_REGION "$AWS_REGION"
+          put STATE_BUCKET "$STATE_BUCKET"
+          put STATE_KEY "$STATE_KEY"
+          put STATE_REGION "$STATE_REGION"
+          put STATE_KMS_KEY_ID "$STATE_KMS_KEY_ID"
+          put USE_LOCKFILE "$USE_LOCKFILE"
+
+          echo "unpublish app=${APP_SLUG} env=${DEPLOY_ENV} release=${RELEASE_ID} state=s3://${STATE_BUCKET}/${STATE_KEY}"
+
+      - name: Configure AWS credentials
+        # The same Stage identity and the same org secrets as
+        # forge-deploy-ecs.yml (RFC-0102 R-3): permanent org-level access keys,
+        # no OIDC, no session token. The destroy needs no grant the apply does
+        # not already have.
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          aws-access-key-id: ${{ secrets.NMBLR_FOUNDRY_AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.NMBLR_FOUNDRY_AWS_SECRET_KEY }}
+          aws-region: ${{ env.APP_AWS_REGION }}
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f # v1.0.8
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          # The wrapper rewrites stdout/stderr and swallows exit codes into
+          # step outputs; this lane's exit status IS the contract.
+          tofu_wrapper: false
+
+      # -----------------------------------------------------------------------
+      # 2. Materialize the tofu root.
+      # -----------------------------------------------------------------------
+      #
+      # The providers file, the partial backend declaration and the backend
+      # settings are BYTE-IDENTICAL to forge-deploy-ecs.yml's (and therefore to
+      # pkg/deploy/ecs/module_sync.go's): the destroy must init against the
+      # exact state the apply wrote. A parity test in the forge repo compares
+      # them. The "Generated by the Forge ecs adapter" headers are part of that
+      # byte-identity.
+      - name: Render tofu workdir
+        env:
+          SPEC_JSON: ${{ inputs.spec }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -d "$TF_WORKDIR" ]; then
+            echo "::error::${TF_WORKDIR} is missing — the vendored module was never injected into this repo, so there is nothing this workflow can destroy from here. Re-stage the app." >&2
+            exit 1
+          fi
+          cd "$TF_WORKDIR"
+
+          # tfvars — the module's 14 required inputs, plus the three list
+          # inputs written EMPTY. A destroy works from state, so no capability
+          # binding, sidecar or App Configuration value is needed, and none is
+          # ever on this lane's wire. Every other optional input keeps its
+          # module default. security_group_ids and subnet_ids are sorted
+          # exactly as the deploy workflow sorts them.
+          jq '{
+            app_id:             .app_id,
+            app_slug:           .app_slug,
+            image_digest:       .image_digest,
+            ecr_registry:       .ecr_registry,
+            ecr_repo:           .ecr_repo,
+            env:                .env,
+            cluster_arn:        .cluster_arn,
+            security_group_ids: (.security_group_ids | sort),
+            subnet_ids:         (.subnet_ids | sort),
+            task_exec_role_arn: .task_exec_role_arn,
+            task_role_arn:      .task_role_arn,
+            alb_listener_arn:   .alb_listener_arn,
+            vpc_id:             .vpc_id,
+            parent_zone:        .parent_zone,
+            bindings:           [],
+            sidecars:           [],
+            environment:        []
+          }' <<< "$SPEC_JSON" > terraform.tfvars.json
+
+          cat > _forge_providers.tf <<EOF
+          # Generated by the Forge ecs adapter. Do not edit.
+          provider "aws" {
+            region = "${APP_AWS_REGION}"
+          }
+          EOF
+
+          cat > _forge_backend.tf <<'EOF'
+          # Generated by the Forge ecs adapter. Do not edit.
+          #
+          # Partial backend: the type is declared here, every setting arrives via
+          # "tofu init -backend-config=_forge_backend.hcl".
+          terraform {
+            backend "s3" {}
+          }
+          EOF
+
+          # Backend settings: the same bucket, key, region, encryption and S3
+          # native lockfile as the deploy. `key` arrives pre-rendered by
+          # Dispatch (deploy.StateKeyFor) with the RAW env, internal_prod's
+          # underscore included.
+          {
+            echo '# Generated by the Forge ecs adapter. Do not edit.'
+            echo '#'
+            echo '# Per-(App, env) tofu state. Locking is the S3 native lockfile'
+            echo '# (owner ruling 2026-08-19) — there is no dynamodb_table line and'
+            echo '# adding one would split the fleet across two lock protocols.'
+            printf 'bucket       = "%s"\n' "$STATE_BUCKET"
+            printf 'key          = "%s"\n' "$STATE_KEY"
+            printf 'region       = "%s"\n' "$STATE_REGION"
+            echo   'encrypt      = true'
+            printf 'use_lockfile = %s\n' "$USE_LOCKFILE"
+            if [ -n "$STATE_KMS_KEY_ID" ]; then
+              printf 'kms_key_id   = "%s"\n' "$STATE_KMS_KEY_ID"
+            fi
+          } > _forge_backend.hcl
+
+          echo "--- _forge_backend.hcl ---"
+          cat _forge_backend.hcl
+
+      # -----------------------------------------------------------------------
+      # 3. init — the deploy workflow's argv, exactly.
+      # -----------------------------------------------------------------------
+      - name: tofu init
+        run: |
+          set -euo pipefail
+          cd "$TF_WORKDIR"
+          tofu init -input=false -no-color -reconfigure -backend-config="$(pwd)/_forge_backend.hcl"
+
+      # -----------------------------------------------------------------------
+      # 4. destroy. Once.
+      # -----------------------------------------------------------------------
+      #
+      # There is no apply anywhere in this file and no image build or push: the
+      # only thing this workflow changes is what the state says exists. It
+      # reads no tofu outputs back and reports nothing; the run's conclusion
+      # is the entire signal Dispatch consumes. No `continue-on-error` and
+      # `set -euo pipefail` in every body, so a failed step fails the run.
+      #
+      # The step is NOT named after the command, deliberately: the parity test
+      # counts the command's occurrences in the comment-stripped run bodies.
+      - name: Take the ECS environment offline (exactly once)
+        run: |
+          set -euo pipefail
+          cd "$TF_WORKDIR"
+          tofu destroy -input=false -no-color -auto-approve -var-file="$(pwd)/terraform.tfvars.json"
