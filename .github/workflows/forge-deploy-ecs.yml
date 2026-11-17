@@ -1,0 +1,592 @@
+name: forge-deploy-ecs
+
+# Forge Container Deploy — ECS Fargate behind the app-tier ALB, executed IN THE
+# APP REPO (RFC-0102).
+#
+# This workflow is the GHA transliteration of the in-process ECS connector
+# (pkg/deploy/ecs/adapter.go `Deploy`). Dispatch dispatches it and correlates
+# the run; the workflow does the work. Nothing here reports status back: the
+# `workflow_run` completion webhook is the contract, the App's live URL is the
+# birth prediction RFC-0100 wrote at INSERT, and the logs live on the run.
+# **Exit status is the whole contract.**
+#
+# Unlike the edge lane, this lane ships GHA-FIRST: the container connector has
+# never deployed anything on Forge's own substrate, so
+# `FORGE_DISPATCH_ECS_EXECUTOR` defaults to `gha` (RFC-0102 R-6 / P-OQ-3). The
+# in-process executor stays compiling and kill-switch-selectable. Both
+# executors init against the SAME S3 tofu backend, which is what makes flipping
+# the switch mid-day legal — and what makes byte-equality of the generated
+# backend files below load-bearing rather than cosmetic.
+#
+# # How this differs from forge-deploy-edge.yml (RFC-0102 C-12)
+#
+# Materially simpler, and deliberately so. There is:
+#
+#   - no ECR login and no image pull. The ECS task-EXECUTION role pulls the
+#     image at task start; the runner never touches the registry.
+#   - no image extraction and no bucket upload. There are no artifact bytes to
+#     move — the deploy IS the task-definition revision.
+#   - no `aws.global` provider alias. deploy/apps/modules/ecs/versions.tf
+#     declares no configuration_aliases and the module touches no global-only
+#     service; every resource it creates is regional.
+#   - no AWS CLI use at all. The module has no local-exec / null_resource.
+#   - no bucket-existence branch, and therefore EXACTLY ONE apply.
+#
+# # The tofu module
+#
+# `.forge/deploy/ecs/*.tf` is a VENDORED copy of `deploy/apps/modules/ecs`
+# from the forge repo, re-injected on every Stage. Do not hand-edit it: a
+# drift test in the forge repo fails the build when the two diverge, and your
+# edit is overwritten by the next Stage anyway.
+#
+# The module ships as a CHILD module (no provider blocks of its own), so the
+# provider configuration is GENERATED at runtime below — byte-identical to what
+# `module_sync.go writeRootProviders` writes for the in-process executor.
+
+on:
+  workflow_dispatch:
+    inputs:
+      spec:
+        description: >-
+          Single JSON deploy spec minted by Dispatch. GitHub caps
+          workflow_dispatch at 10 inputs and the container spec is ~30 fields,
+          so it travels as one blob. Read through an env var, never
+          interpolated into a shell body. Carries capability binding
+          IDENTIFIERS — Secret Manager / SSM ARNs — and never a capability
+          VALUE (owner ruling RFC-0102 P-OQ-1, which deliberately reverses
+          RFC-0101 P-OQ-6 for this lane: an ARN is an identifier, the secret is
+          resolved by the task-execution role at task start, and a plaintext
+          value is refused by the ARN-shape guard below before any AWS call).
+          spec_version 2 (D-198) adds `environment`, the App's App
+          Configuration `config` variables — non-secret by the builder's own
+          declaration — as plain {name, value} entries for the App container;
+          its secrets still travel as `bindings` ARNs.
+        required: true
+        type: string
+
+concurrency:
+  # Per-repo, never cancel-in-progress: a cancelled `tofu apply` can strand the
+  # S3 lockfile and leaves the ECS service half-updated. Mirrors
+  # forge-deploy-edge.yml's group discipline.
+  group: forge-deploy-ecs-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  # Read-only, and deliberately NOTHING else. The AWS credentials are permanent
+  # org-level access keys (see the credentials step), so this workflow needs no
+  # federated-token permission of any kind.
+  contents: read
+
+env:
+  # Lockstep with the forge repo's CI pin (.github/workflows/ci.yml) and with
+  # services/dispatch/Dockerfile. >= 1.10 is a hard floor: `use_lockfile` did
+  # not exist before it, and every module pins required_version >= 1.10.0.
+  TOFU_VERSION: "1.10.0"
+  # The vendored module + all generated files. tofu runs with this as its cwd.
+  TF_WORKDIR: .forge/deploy/ecs
+
+jobs:
+  deploy-ecs:
+    name: Deploy to ECS (Fargate)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # -----------------------------------------------------------------------
+      # 1. Parse the spec.
+      # -----------------------------------------------------------------------
+      #
+      # SPEC_JSON is read through an env var and never through `${{ }}` inside
+      # the script body: `${{ }}` substitution happens BEFORE the shell sees the
+      # line, so an interpolated value is shell source. Same defence as
+      # forge-deploy-edge.yml and forge-deploy.yml's app_env_b64 handling.
+      #
+      # Everything that can fail on the SHAPE of the spec fails here, before the
+      # credentials step — so a malformed dispatch costs zero AWS calls and
+      # names the offending field.
+      - name: Parse deploy spec
+        env:
+          SPEC_JSON: ${{ inputs.spec }}
+        run: |
+          set -euo pipefail
+
+          # Version 2 (D-198) adds `environment`. Dispatch sends 2 ONLY when
+          # that list is non-empty, so an App with no App Configuration
+          # `config` variables keeps sending 1 and an older staged workflow
+          # keeps working for it. An older workflow handed a 2 refuses here,
+          # loudly, instead of silently dropping the variables the App needs
+          # to boot. Both versions are accepted below.
+          SPEC_VERSION="$(jq -r '.spec_version // empty' <<< "$SPEC_JSON")"
+          case "$SPEC_VERSION" in
+            1|2) ;;
+            *)
+              echo "::error::unsupported spec_version '${SPEC_VERSION}' — this workflow understands versions 1 and 2. Re-stage the app to pick up a newer workflow." >&2
+              exit 1
+              ;;
+          esac
+
+          # put() refuses embedded newlines: a newline in a value would let a
+          # crafted spec field define ADDITIONAL environment variables through
+          # $GITHUB_ENV. Dispatch is the only legitimate dispatcher, but the
+          # workflow is manually dispatchable by anyone with repo write, so the
+          # guard is cheap insurance.
+          put() {
+            local key="$1" val="$2"
+            case "$val" in
+              *$'\n'*)
+                echo "::error::spec field ${key} contains a newline — refusing" >&2
+                exit 1
+                ;;
+            esac
+            printf '%s=%s\n' "$key" "$val" >> "$GITHUB_ENV"
+          }
+
+          require() {
+            local key="$1" val="$2"
+            if [ -z "$val" ]; then
+              echo "::error::spec field ${key} is required and empty" >&2
+              exit 1
+            fi
+          }
+
+          # require_list() is require()'s twin for the two list-typed inputs.
+          # An empty array is exactly as fatal as an absent scalar: the module
+          # validates `length(...) > 0` on both, and failing here names the
+          # field instead of surfacing three steps later as a tofu variable
+          # validation error.
+          require_list() {
+            local key="$1" n
+            n="$(jq -r --arg k "$key" '(.[$k] // []) | length' <<< "$SPEC_JSON")"
+            if [ "$n" -lt 1 ]; then
+              echo "::error::spec field ${key} must be a non-empty array" >&2
+              exit 1
+            fi
+          }
+
+          APP_ID="$(jq -r '.app_id // ""' <<< "$SPEC_JSON")"
+          APP_SLUG="$(jq -r '.app_slug // ""' <<< "$SPEC_JSON")"
+          DEPLOY_ENV="$(jq -r '.env // ""' <<< "$SPEC_JSON")"
+          RELEASE_ID="$(jq -r '.release_id // ""' <<< "$SPEC_JSON")"
+          AWS_REGION="$(jq -r '.aws_region // ""' <<< "$SPEC_JSON")"
+          ECR_REGISTRY="$(jq -r '.ecr_registry // ""' <<< "$SPEC_JSON")"
+          # ecr_repo is derived DISPATCH-SIDE from the App's clone URL, not from
+          # the slug — the two diverge (release.go buildDeploySpec; a live
+          # 2026-08-18 defect). The workflow consumes it and must never
+          # re-derive it from APP_SLUG.
+          ECR_REPO="$(jq -r '.ecr_repo // ""' <<< "$SPEC_JSON")"
+          IMAGE_DIGEST="$(jq -r '.image_digest // ""' <<< "$SPEC_JSON")"
+          STATE_BUCKET="$(jq -r '.state_bucket // ""' <<< "$SPEC_JSON")"
+          STATE_KEY="$(jq -r '.state_key // ""' <<< "$SPEC_JSON")"
+          STATE_REGION="$(jq -r '.state_region // ""' <<< "$SPEC_JSON")"
+          STATE_KMS_KEY_ID="$(jq -r '.state_kms_key_id // ""' <<< "$SPEC_JSON")"
+          USE_LOCKFILE="$(jq -r 'if .use_lockfile == false then "false" else "true" end' <<< "$SPEC_JSON")"
+
+          require app_id "$APP_ID"
+          require app_slug "$APP_SLUG"
+          require env "$DEPLOY_ENV"
+          require aws_region "$AWS_REGION"
+          require ecr_registry "$ECR_REGISTRY"
+          require ecr_repo "$ECR_REPO"
+          require image_digest "$IMAGE_DIGEST"
+          require state_bucket "$STATE_BUCKET"
+          require state_key "$STATE_KEY"
+          require state_region "$STATE_REGION"
+
+          # The substrate ARNs are consumed only by the tfvars projection later,
+          # but they are checked HERE so a malformed spec fails on the first
+          # step with a field name, rather than three steps later as a tofu
+          # variable validation error against a value the log has already
+          # truncated. These eight are the RFC-0102 Part A substrate handoff.
+          require cluster_arn "$(jq -r '.cluster_arn // ""' <<< "$SPEC_JSON")"
+          require task_exec_role_arn "$(jq -r '.task_exec_role_arn // ""' <<< "$SPEC_JSON")"
+          require task_role_arn "$(jq -r '.task_role_arn // ""' <<< "$SPEC_JSON")"
+          require alb_listener_arn "$(jq -r '.alb_listener_arn // ""' <<< "$SPEC_JSON")"
+          require vpc_id "$(jq -r '.vpc_id // ""' <<< "$SPEC_JSON")"
+          require parent_zone "$(jq -r '.parent_zone // ""' <<< "$SPEC_JSON")"
+          require_list security_group_ids
+          require_list subnet_ids
+
+          case "$DEPLOY_ENV" in
+            staging|internal_prod|public_prod) ;;
+            *)
+              echo "::error::env '${DEPLOY_ENV}' is not one of staging|internal_prod|public_prod" >&2
+              exit 1
+              ;;
+          esac
+
+          # Promote-by-digest (D-65). The module carries the strict
+          # ^sha256:[a-f0-9]{64}$ regex; this cheaper prefix guard exists so the
+          # failure names the rule rather than reading as a regex mismatch.
+          case "$IMAGE_DIGEST" in
+            sha256:*) ;;
+            *)
+              echo "::error::image_digest '${IMAGE_DIGEST}' must be of the form sha256:<hex> — deploying by tag is forbidden" >&2
+              exit 1
+              ;;
+          esac
+
+          # TD-0013 gate, on the wire. The module has the same regex in
+          # variables.tf and Dispatch has it on the spec type, so this is the
+          # third of three — deliberately, because THIS is the one that runs in
+          # a place where a mistake would be echoed into a public-ish run log.
+          # Only an ARN can pass; a plaintext capability value cannot.
+          BAD_BINDINGS="$(jq -r '[(.bindings // [])[] | select(((.secret_arn // "") | test("^arn:aws:(secretsmanager|ssm):")) | not) | (.env_name // "?")] | join(", ")' <<< "$SPEC_JSON")"
+          if [ -n "$BAD_BINDINGS" ]; then
+            echo "::error::binding(s) [${BAD_BINDINGS}] do not carry an arn:aws:secretsmanager:... or arn:aws:ssm:... secret_arn — TD-0013 forbids plaintext capability values, and this lane puts bindings on the wire only because ARNs are identifiers" >&2
+            exit 1
+          fi
+
+          # The sidecar twin of the gate above (RFC-0117). Dispatch validates
+          # all four sidecar rules before it dispatches and the vendored
+          # module re-validates every one of them in variables.tf, so these
+          # three are belt-to-braces — but this workflow is the copy that
+          # runs in the CUSTOMER's repo and is hand-dispatchable by anyone
+          # with repo write, so it has to stand alone.
+          #
+          # Three of the four rules are front-loaded here, not all four:
+          #
+          #   - secret_arn shape, below. The only sidecar rule whose failure
+          #     mode is DISCLOSURE: a plaintext value that reached the tfvars
+          #     projection would be echoed into this run's log. It has to
+          #     fail before any AWS call, exactly like the bindings gate.
+          #   - image digest-pinning (D-65) and the reserved `web` name
+          #     (R-15). Both fail SILENTLY WRONG rather than loudly: a
+          #     floating tag lets the bytes running beside the App change
+          #     between staging and production without a release, and a
+          #     sidecar named `web` would inherit the App's ALB ingress.
+          #     Cheap to name here; expensive to diagnose as a tofu variable
+          #     validation error three steps later.
+          #
+          # Empty and duplicate sidecar names are deliberately NOT repeated
+          # here. They cannot disclose anything and cannot produce a wrong
+          # deploy — the module's own validations refuse them at plan time,
+          # inside this same run. Nor is there a newline guard: no sidecar
+          # scalar goes through put() into $GITHUB_ENV, so the $GITHUB_ENV
+          # injection this file guards against elsewhere has no path here.
+          BAD_SIDECAR_SECRETS="$(jq -r '[(.sidecars // [])[] | . as $s | ((.secrets // [])[] | select(((.secret_arn // "") | test("^arn:aws:(secretsmanager|ssm):")) | not) | "\($s.name // "?")/\(.env_name // "?")")] | join(", ")' <<< "$SPEC_JSON")"
+          if [ -n "$BAD_SIDECAR_SECRETS" ]; then
+            echo "::error::sidecar secret(s) [${BAD_SIDECAR_SECRETS}] (listed as sidecar/env_name) do not carry an arn:aws:secretsmanager:... or arn:aws:ssm:... secret_arn — sidecar secrets inherit the top-level bindings' TD-0013 gate, and for the same reason: only an identifier may travel on this lane" >&2
+            exit 1
+          fi
+
+          BAD_SIDECAR_IMAGES="$(jq -r '[(.sidecars // [])[] | select(((.image // "") | test("@sha256:[a-f0-9]{64}$")) | not) | (.name // "?")] | join(", ")' <<< "$SPEC_JSON")"
+          if [ -n "$BAD_SIDECAR_IMAGES" ]; then
+            echo "::error::sidecar(s) [${BAD_SIDECAR_IMAGES}] have an image that is not digest-pinned — every sidecar image must end in @sha256:<64 hex chars>, the same rule the App's own image is held to (D-65 promote-by-digest)" >&2
+            exit 1
+          fi
+
+          RESERVED_SIDECARS="$(jq -r '[(.sidecars // [])[] | select((.name // "") == "web") | .name] | length' <<< "$SPEC_JSON")"
+          if [ "$RESERVED_SIDECARS" != "0" ]; then
+            echo "::error::a sidecar is named 'web', which is reserved for the App's own container — aws_ecs_service.app's load_balancer block hardcodes container_name = 'web', and that hardcoding is the only reason a sidecar is unreachable from the ALB. A sidecar taking the name would collide with the App AND inherit its ingress. Rename the sidecar." >&2
+            exit 1
+          fi
+
+          # App Configuration `config` variables (D-198). Only their NAMES are
+          # read in this step — the values go from the spec JSON straight into
+          # terraform.tfvars.json by jq in the render step and never through
+          # put(), $GITHUB_ENV or a shell variable. The three rules mirror the
+          # module's validations so a hand-dispatched spec fails here, before
+          # the credentials step, naming the offending variable:
+          #   - env-var shaped (^[A-Z_][A-Z0-9_]*$),
+          #   - never FORGE_* (Forge's own namespace),
+          #   - never a binding's name, and never twice.
+          BAD_ENV_NAMES="$(jq -r '[(.environment // [])[] | (.name // "") | select(test("^[A-Z_][A-Z0-9_]*$") | not) | @json] | join(", ")' <<< "$SPEC_JSON")"
+          if [ -n "$BAD_ENV_NAMES" ]; then
+            echo "::error::environment name(s) [${BAD_ENV_NAMES}] are not ^[A-Z_][A-Z0-9_]*$ — refusing" >&2
+            exit 1
+          fi
+          FORGE_ENV_NAMES="$(jq -r '[(.environment // [])[] | (.name // "") | select(startswith("FORGE_"))] | join(", ")' <<< "$SPEC_JSON")"
+          if [ -n "$FORGE_ENV_NAMES" ]; then
+            echo "::error::environment name(s) [${FORGE_ENV_NAMES}] are in Forge's reserved FORGE_ namespace — a builder's variable must never override a Forge-provided one (D-198)" >&2
+            exit 1
+          fi
+          SHADOWED_ENV_NAMES="$(jq -r '[(.bindings // []) | map(.env_name)] as [$b] | [(.environment // [])[] | (.name // "") | select(. as $n | $b | index($n))] | join(", ")' <<< "$SPEC_JSON")"
+          if [ -n "$SHADOWED_ENV_NAMES" ]; then
+            echo "::error::environment name(s) [${SHADOWED_ENV_NAMES}] are also bindings — a builder's variable must never override a capability's or a secret's (D-198)" >&2
+            exit 1
+          fi
+          DUP_ENV_NAMES="$(jq -r '[(.environment // [])[] | (.name // "")] | group_by(.) | map(select(length > 1) | .[0]) | join(", ")' <<< "$SPEC_JSON")"
+          if [ -n "$DUP_ENV_NAMES" ]; then
+            echo "::error::environment name(s) [${DUP_ENV_NAMES}] appear more than once — refusing" >&2
+            exit 1
+          fi
+
+          put APP_ID "$APP_ID"
+          put APP_SLUG "$APP_SLUG"
+          put DEPLOY_ENV "$DEPLOY_ENV"
+          put RELEASE_ID "$RELEASE_ID"
+          put APP_AWS_REGION "$AWS_REGION"
+          put ECR_REGISTRY "$ECR_REGISTRY"
+          put ECR_REPO "$ECR_REPO"
+          put IMAGE_DIGEST "$IMAGE_DIGEST"
+          put STATE_BUCKET "$STATE_BUCKET"
+          put STATE_KEY "$STATE_KEY"
+          put STATE_REGION "$STATE_REGION"
+          put STATE_KMS_KEY_ID "$STATE_KMS_KEY_ID"
+          put USE_LOCKFILE "$USE_LOCKFILE"
+
+          echo "app=${APP_SLUG} env=${DEPLOY_ENV} image=${ECR_REGISTRY}/${ECR_REPO}@${IMAGE_DIGEST}"
+
+      - name: Configure AWS credentials
+        # Owner ruling 2026-08-19 (RFC-0101 OQ-1, restated as RFC-0102 R-3): the
+        # deploy lane reuses the Stage identity and the SAME org secrets
+        # forge-stage.yml reads. No OIDC, no second IAM user, and NO session
+        # token — these are permanent org-level access keys. The container
+        # grants (ecs / elasticloadbalancing / logs / iam:PassRole) are attached
+        # to that user by tofu, in
+        # deploy/forge/modules/iam/app-deploy-policy.tf, and NEVER by editing
+        # the console-managed CI policy.
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          aws-access-key-id: ${{ secrets.NMBLR_FOUNDRY_AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.NMBLR_FOUNDRY_AWS_SECRET_KEY }}
+          aws-region: ${{ env.APP_AWS_REGION }}
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@9d84900f3238fab8cd84ce47d658d25dd008be2f # v1.0.8
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          # The wrapper is disabled for the same reason the edge lane disables
+          # it: it rewrites stdout/stderr and swallows exit codes into step
+          # outputs, and this lane's exit status IS the contract Dispatch reads.
+          tofu_wrapper: false
+
+      # -----------------------------------------------------------------------
+      # 2. Materialize the tofu root.
+      # -----------------------------------------------------------------------
+      #
+      # Three generated files, all BYTE-IDENTICAL to what the in-process
+      # executor writes (pkg/deploy/ecs/module_sync.go). Byte-identity is not
+      # tidiness: both executors must init against the same backend settings or
+      # the kill-switch drill (flip to `connector`, redeploy the same app) is a
+      # lie. A parity test in the forge repo diffs these heredocs against the Go
+      # writers.
+      #
+      # The "Generated by the Forge ecs adapter" header is reproduced verbatim
+      # for that reason — it names the CONTRACT, not the process that ran. Note
+      # it says "ecs", not "edge": the two lanes write deliberately different
+      # provenance headers, and module_sync.go's own header comment says so.
+      #
+      # terraform.tfvars.json is written BEFORE init, exactly as the adapter
+      # does. That ordering is why `tofu init -from-module` cannot be used here:
+      # it refuses a non-empty directory.
+      - name: Render tofu workdir
+        env:
+          SPEC_JSON: ${{ inputs.spec }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -d "$TF_WORKDIR" ]; then
+            echo "::error::${TF_WORKDIR} is missing — the vendored module was never injected into this repo. Re-stage the app (stage-inject writes the module alongside this workflow)." >&2
+            exit 1
+          fi
+          cd "$TF_WORKDIR"
+
+          # tfvars — the module's 23 declared inputs plus desired_count (24 in
+          # total), projected from the spec. Mirrors pkg/deploy/ecs/tfvars.go
+          # RenderTFVars, INCLUDING its determinism rules: security_group_ids
+          # and subnet_ids are sorted lexically, bindings are sorted by
+          # env_name, and sidecars are sorted by name with each sidecar's
+          # secrets sorted by env_name, so upstream map-iteration order can
+          # never produce two different tfvars files for one input
+          # (RenderTFVars:135-141).
+          #
+          # A sidecar's `environment` is deliberately NOT sorted — a third
+          # sort, in RenderTFVars' words. It is a literal list written by the
+          # provisioner that builds the sidecar, so its order is already
+          # stable run to run, and adding a sort here would have to be
+          # mirrored in RenderTFVars AND in buildECSDeploySpec or the three
+          # renderers would diverge — the exact failure the other two sorts
+          # exist to prevent.
+          #
+          # bindings are re-projected key-by-key to {env_name, secret_arn},
+          # and sidecars key-by-key to {name, image, environment, secrets}:
+          # any other field a future spec might carry is DROPPED here rather
+          # than forwarded, so the only binding data that can ever reach the
+          # module — or this run's log — is the pair the TD-0013 gate above
+          # validated. `{name, value}` inside a sidecar's environment is jq's
+          # shorthand for the same key-by-key re-projection and drops unknown
+          # fields identically.
+          #
+          # RFC-0117 DG-7 — `sidecars` is ADDITIVE and spec_version STAYS 1.
+          # The version guard at the top of this file is an equality test, so
+          # a bump would strand every already-staged App: their injected
+          # workflow would hard-fail on the first dispatch after the bump,
+          # before it did anything else. Additive degrades instead of
+          # breaking — an older staged repo's workflow simply drops the
+          # `sidecars` field it does not project, and if a repo ever carried
+          # this workflow against a pre-RFC-0117 vendored module, tofu would
+          # refuse the undeclared `sidecars` key in terraform.tfvars.json.
+          # Re-stage is the remedy, and it is this file's ESTABLISHED remedy
+          # for exactly that class of mismatch: the workdir check above says
+          # "Re-stage the app (stage-inject writes the module alongside this
+          # workflow)", and the spec_version guard itself says "Re-stage the
+          # app to pick up a newer workflow."
+          #
+          # desired_count travels even though the service declares
+          # `lifecycle { ignore_changes = [desired_count] }` (RFC-0102 P-OQ-6):
+          # sending every default explicitly is what keeps the two executors'
+          # tfvars matching field-for-field, and write-once makes the cost nil.
+          #
+          # `environment` (D-198) is the App container's App Configuration
+          # `config` variables, re-projected key-by-key to {name, value} and
+          # sorted by name — the same sort RenderTFVars and buildECSDeploySpec
+          # apply, because the list is built from App Configuration rows whose
+          # order is the store's. Values reach the tfvars file as JSON strings
+          # and nowhere else in this run: a newline, quote or `$` in a value is
+          # JSON-escaped by jq, never seen by a shell.
+          #
+          # Defaults are applied Dispatch-side; `// ...` here only guards a
+          # field omitted by an older Dispatch.
+          jq '{
+            app_id:             .app_id,
+            app_slug:           .app_slug,
+            image_digest:       .image_digest,
+            ecr_registry:       .ecr_registry,
+            ecr_repo:           .ecr_repo,
+            env:                .env,
+            exposure:           (.exposure // "internal"),
+            cluster_arn:        .cluster_arn,
+            security_group_ids: (.security_group_ids | sort),
+            subnet_ids:         (.subnet_ids | sort),
+            task_exec_role_arn: .task_exec_role_arn,
+            task_role_arn:      .task_role_arn,
+            alb_listener_arn:   .alb_listener_arn,
+            vpc_id:             .vpc_id,
+            parent_zone:        .parent_zone,
+            container_port:     (.container_port // 80),
+            cpu:                (.cpu // 256),
+            memory:             (.memory // 512),
+            desired_count:      (.desired_count // 1),
+            log_retention_days: (.log_retention_days // 7),
+            bindings:           ((.bindings // []) | map({env_name: .env_name, secret_arn: .secret_arn}) | sort_by(.env_name)),
+            sidecars:           ((.sidecars // []) | map({name: .name, image: .image, environment: ((.environment // []) | map({name, value})), secrets: ((.secrets // []) | map({env_name: .env_name, secret_arn: .secret_arn}) | sort_by(.env_name))}) | sort_by(.name)),
+            environment:        ((.environment // []) | map({name, value}) | sort_by(.name)),
+            release_id:         (.release_id // "")
+          }' <<< "$SPEC_JSON" > terraform.tfvars.json
+
+          # Providers — the module is a CHILD module and carries no provider
+          # block of its own. ONE provider, NO alias: unlike the edge module it
+          # declares no configuration_aliases and touches no global-only service
+          # (its cluster service, task definition, target group, listener rule
+          # and log group are all regional), so an aws.global block here would
+          # declare a provider nothing references.
+          #
+          # Pinning the region is load-bearing, not decorative (RFC-0102 C-7).
+          # Without this file the module's region comes from the executing
+          # process's ambient AWS_REGION, read back by `data "aws_region"
+          # "current"` and baked into the task definition's awslogs-region.
+          # Dispatch's container and a GitHub-hosted runner do not share that
+          # value, so the same App could land its logs in two different regions
+          # depending on which executor ran.
+          cat > _forge_providers.tf <<EOF
+          # Generated by the Forge ecs adapter. Do not edit.
+          provider "aws" {
+            region = "${APP_AWS_REGION}"
+          }
+          EOF
+
+          # Partial backend declaration. The TYPE must live in a .tf file; the
+          # per-(App, env) SETTINGS cannot, because a backend block does not
+          # interpolate. Hence the split.
+          cat > _forge_backend.tf <<'EOF'
+          # Generated by the Forge ecs adapter. Do not edit.
+          #
+          # Partial backend: the type is declared here, every setting arrives via
+          # "tofu init -backend-config=_forge_backend.hcl".
+          terraform {
+            backend "s3" {}
+          }
+          EOF
+
+          # Backend settings. NOTE: no `dynamodb_table` line — locking is the S3
+          # native lockfile (owner ruling 2026-08-19, tofu >= 1.10, RFC-0102
+          # R-4). kms_key_id is emitted ONLY when explicitly configured: naming
+          # an alias the deployment does not own is an AccessDenied on every
+          # apply, and the bucket's default encryption plus `encrypt = true` is
+          # sufficient.
+          #
+          # `key` arrives pre-rendered by Dispatch (deploy.StateKeyFor) and
+          # carries the RAW deploy env — internal_prod keeps its underscore.
+          # The internal/public shortening exists only in BUCKET names, which
+          # forbid underscores; aligning the two would silently repoint every
+          # App at a different state file.
+          {
+            echo '# Generated by the Forge ecs adapter. Do not edit.'
+            echo '#'
+            echo '# Per-(App, env) tofu state. Locking is the S3 native lockfile'
+            echo '# (owner ruling 2026-08-19) — there is no dynamodb_table line and'
+            echo '# adding one would split the fleet across two lock protocols.'
+            printf 'bucket       = "%s"\n' "$STATE_BUCKET"
+            printf 'key          = "%s"\n' "$STATE_KEY"
+            printf 'region       = "%s"\n' "$STATE_REGION"
+            echo   'encrypt      = true'
+            printf 'use_lockfile = %s\n' "$USE_LOCKFILE"
+            if [ -n "$STATE_KMS_KEY_ID" ]; then
+              printf 'kms_key_id   = "%s"\n' "$STATE_KMS_KEY_ID"
+            fi
+          } > _forge_backend.hcl
+
+          echo "--- _forge_backend.hcl ---"
+          cat _forge_backend.hcl
+
+      # -----------------------------------------------------------------------
+      # 3. init.
+      # -----------------------------------------------------------------------
+      #
+      # The argv below must match pkg/deploy/ecs/adapter.go tofuInit exactly:
+      #
+      #   tofu init -input=false -no-color -reconfigure -backend-config=<path>/_forge_backend.hcl
+      #
+      # That equality is the whole kill-switch contract: if the adapter's argv
+      # changes and this line does not, an App that switches executors mid-life
+      # inits against a different backend and the "no-op diff" drill becomes a
+      # create diff. A parity test in the forge repo derives the expected argv
+      # FROM the adapter and asserts this substring, so it cannot pass by
+      # agreeing with a stale literal.
+      #
+      # `-reconfigure`, not `-migrate-state`: this workdir is scratch, so the
+      # only thing a migration could ever find is a stale local state, and
+      # silently pushing that up would be worse than starting from the remote
+      # key. Matches deploy/apps/scripts/init-per-app.sh, which has always used
+      # -reconfigure.
+      - name: tofu init
+        run: |
+          set -euo pipefail
+          cd "$TF_WORKDIR"
+          tofu init -input=false -no-color -reconfigure -backend-config="$(pwd)/_forge_backend.hcl"
+
+      # -----------------------------------------------------------------------
+      # 4. apply. Once.
+      # -----------------------------------------------------------------------
+      #
+      # Reproduces pkg/deploy/ecs/adapter.go Deploy's single apply verbatim.
+      # There is no artifact to publish and no bucket to probe, so there is no
+      # ordered branch and no second apply — the three ugliest deviations of the
+      # edge lane (whiteout semantics, extraction hoisting, apply count) have no
+      # analogue here (RFC-0102 C-12).
+      #
+      # What this step deliberately does NOT do:
+      #
+      #   - it reads no tofu outputs back, and emits no URL. The App's live URL
+      #     is the prediction RFC-0100 wrote at INSERT; anything emitted here
+      #     could only disagree with it (AC-5 depends on this silence).
+      #   - it reports no status anywhere. The run's conclusion, delivered as a
+      #     `workflow_run` webhook and swept by Dispatch's deploy reconciler, is
+      #     the entire signal.
+      #
+      # No `continue-on-error` anywhere on this path (AC-6) and
+      # `set -euo pipefail` in every body: a failed step must fail the run,
+      # because the run's conclusion is the only signal Dispatch receives.
+      #
+      # The step is NOT named "tofu apply", deliberately: the exactly-one-apply
+      # parity test counts occurrences of that token in a comment-stripped view
+      # of this file, and a step name is not a comment. Keep the token on the
+      # command line and nowhere else.
+      - name: Apply the ECS module (exactly once)
+        run: |
+          set -euo pipefail
+          cd "$TF_WORKDIR"
+          tofu apply -input=false -no-color -auto-approve -var-file="$(pwd)/terraform.tfvars.json"
